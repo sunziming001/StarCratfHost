@@ -1,0 +1,10 @@
+[project]
+name = "starcraft-lan-host"
+version = "0.1.0"
+description = "Experimental Python LAN host relay for StarCraft/Brood War SEXP 0xC3 captures."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
