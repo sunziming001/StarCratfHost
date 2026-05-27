@@ -1,6 +1,6 @@
 # StarCraft LAN Host Relay
 
-Experimental Python implementation of a non-player LAN host service for the
+Experimental Python implementation of a MainHost/SubHost LAN relay for the
 StarCraft/Brood War UDP protocol seen in `host2.pcapng`.
 
 Run:
@@ -21,6 +21,7 @@ The first version is intentionally narrow:
 - `SEXP / 0xC3`
 - UDP `6111` room discovery and UDP `6112` Storm traffic
 - fixed 1v1 room
+- MainHost/SubHost view: `Sun` is MainHost, and `SunX` is the host visible to MainHost
 - fixed Challenger room/map metadata
 - central relay: real clients talk to Python, not to each other
 - periodic LAN room advertisements, plus replies to client search broadcasts

@@ -148,12 +148,13 @@ def roomdata_payload(slot0_force: int = 1, slot1_force: int = 1) -> bytes:
         " 06 06 00 00 00 00 00 00 00 00 00 00"
         " 06 06 02 01 00 02 01 00 00 00 00 00"
         " 06 06 00 00 00 00 00 00 00 00 00 00"
-        " 01 01 00 00"
+        " 00 00 00 00"
         " 00 00 00 00 01 00 00 00"
         " 01 01 00 00 00 00 00 00"
     ))
-    # Default values mirror host2.pcapng exactly: both active slots have
-    # forc=1 in the captured Challenger melee room.
+    # Challenger's LAN ROOMDATA capture uses force=1 for the first two active
+    # slots. This differs from the raw CHK FORC section, so prefer the wire
+    # value observed in the client/host capture.
     force_offset = 1 + 2 + 2 + 2 + 12 + 12 + 12
     payload[force_offset] = slot0_force & 0xFF
     payload[force_offset + 1] = slot1_force & 0xFF
@@ -235,6 +236,9 @@ def slot_sync_payload(
     player1_id: int = 1,
     player0_active: bool = True,
     player1_active: bool = True,
+    player0_team: int = 1,
+    player1_team: int = 2,
+    include_map_percent: bool = True,
     include_virtual_host: bool = False,
 ) -> bytes:
     slot0_player = player0_id if player0_active else 0xFF
@@ -248,20 +252,20 @@ def slot_sync_payload(
         net_players.append(new_net_player(player0_id))
     if include_virtual_host:
         net_players.append(new_net_player(0))
-    return b"".join(
-        [
-            map_percent_payload(100),
+    parts = [
             slot_update(7, 0xFF, 0, 0, 0),
             slot_update(6, 0xFF, 0, 1, 0),
             slot_update(5, 0xFF, 0, 2, 0),
             slot_update(4, 0xFF, 0, 0, 0),
             slot_update(3, 0xFF, 0, 1, 0),
             slot_update(2, 0xFF, 0, 2, 0),
-            slot_update(1, slot1_player, slot1_state, player1_race, 2),
-            slot_update(0, slot0_player, slot0_state, player0_race, 1),
+            slot_update(1, slot1_player, slot1_state, player1_race, player1_team),
+            slot_update(0, slot0_player, slot0_state, player0_race, player0_team),
             *net_players,
-        ]
-    )
+    ]
+    if include_map_percent:
+        parts.insert(0, map_percent_payload(100))
+    return b"".join(parts)
 
 
 def startgame_payload() -> bytes:
