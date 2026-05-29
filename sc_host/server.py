@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import configparser
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import socket
 import struct
 import time
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from .checksum import PacketError
 from .protocol import (
@@ -29,6 +30,7 @@ from .protocol import (
     CMD_REQUESTJOINOK,
     CMD_STATSCODE,
     DEFAULT_MAP_FILE_NAME,
+    DEFAULT_MAP_CHECKSUM,
     DEFAULT_MAP_SIZE,
     DEFAULT_ROOM_NAME,
     PRODUCT_SEXP,
@@ -74,16 +76,55 @@ Address = tuple[str, int]
 LOG = logging.getLogger("sc_host")
 DEFAULT_MAIN_HOST_NAME = "Sun"
 DEFAULT_SUB_HOST_NAME = "SunX"
+DEFAULT_CONFIG_PATH = "sc_host.ini"
 WIRE_HOST_ID = 0
 MAIN_HOST_PLAYER_ID = 1
 SUB_HOST_PLAYER_ID = 2
 UNKNOWN_PLAYER_ID = 0xFF
-PLAYER_IDS_BY_SLOT = (MAIN_HOST_PLAYER_ID, SUB_HOST_PLAYER_ID)
+DEFAULT_PLAYERS = (
+    ("Sun", MAIN_HOST_PLAYER_ID, 0, 1, 6),
+    ("SunX", SUB_HOST_PLAYER_ID, 1, 2, 6),
+)
 LOBBY_SYNC_NOP_INTERVAL = 0.25
 START_TRANSITION_SYNC_INTERVAL = 0.05
 RESEND_NEXT_SEND_SYNC_INTERVAL = 0.25
 RESEND_THROTTLE_LOG_INTERVAL = 1.0
 JOIN_BOOTSTRAP_SYNC_NOP_COUNT = 2
+
+
+@dataclass(frozen=True)
+class ConfiguredPlayer:
+    name: str
+    player_id: int
+    slot_index: int
+    team: int
+    race: int = 6
+
+
+@dataclass(frozen=True)
+class RoomDataConfig:
+    tileset: int
+    width: int
+    height: int
+    ownr: tuple[int, ...]
+    side: tuple[int, ...]
+    ownr_default: tuple[int, ...]
+    forc: tuple[int, ...]
+    forc_flags: tuple[int, ...]
+    race: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ServerIniConfig:
+    main_host_name: str
+    sub_host_name: str
+    advertise_host_name: str
+    room_name: str
+    map_name: str
+    map_size: int
+    map_checksum: int
+    roomdata: RoomDataConfig
+    players: tuple[ConfiguredPlayer, ...]
 
 
 @dataclass(frozen=True)
@@ -169,8 +210,13 @@ class StarCraftHostServer:
         storm_port: int = 6112,
         main_host_name: str = DEFAULT_MAIN_HOST_NAME,
         sub_host_name: str = DEFAULT_SUB_HOST_NAME,
+        advertise_host_name: str | None = None,
         room_name: str = DEFAULT_ROOM_NAME,
         map_name: str = DEFAULT_MAP_FILE_NAME,
+        map_size: int = DEFAULT_MAP_SIZE,
+        map_checksum: int = DEFAULT_MAP_CHECKSUM,
+        roomdata: RoomDataConfig | None = None,
+        players: Sequence[ConfiguredPlayer] | None = None,
         auto_start_delay: float = 3.0,
         game_state_delay: float = 0.35,
         seed_delay: float = 5.75,
@@ -185,12 +231,22 @@ class StarCraftHostServer:
         self.storm_port = storm_port
         self.main_host_name = main_host_name
         self.sub_host_name = sub_host_name
-        self.player_slot_names = (self.main_host_name, self.sub_host_name)
-        # For the current MainHost/SubHost model, the first tested join path is
-        # Sun joining a room hosted on the wire by SunX.
-        self.host_name = self.sub_host_name
+        self.advertise_host_name = advertise_host_name or self.sub_host_name
+        self.players = self._normalize_players(players)
+        self.players_by_name = {player.name: player for player in self.players}
+        self.players_by_slot = {player.slot_index: player for player in self.players}
+        self.players_by_id = {player.player_id: player for player in self.players}
+        self.max_players = len(self.players)
+        self.max_slots = max(8, max((player.slot_index for player in self.players), default=0) + 1)
+        self._validate_player_model()
+        # Discovery has a single visible host name. Per-client host identity is
+        # still supplied later by GAMEDATA/CMD_PLAYER.
+        self.host_name = self.advertise_host_name
         self.room_name = room_name
         self.map_name = map_name
+        self.map_size = map_size
+        self.map_checksum = map_checksum
+        self.roomdata = roomdata or derive_roomdata_for_players(self.players)
         self.auto_start_delay = auto_start_delay
         self.game_state_delay = game_state_delay
         self.seed_delay = seed_delay
@@ -219,6 +275,41 @@ class StarCraftHostServer:
         self._start_nop_task: asyncio.Task[None] | None = None
         self._advertise_task: asyncio.Task[None] | None = None
         self._last_discovery_log: dict[Address, float] = {}
+
+    @staticmethod
+    def _normalize_players(players: Sequence[ConfiguredPlayer] | None) -> tuple[ConfiguredPlayer, ...]:
+        configured = tuple(players or (ConfiguredPlayer(*values) for values in DEFAULT_PLAYERS))
+        return tuple(sorted(configured, key=lambda player: player.slot_index))
+
+    def _validate_player_model(self) -> None:
+        if not self.players:
+            raise ValueError("at least one player must be configured")
+        duplicate_names = [name for name, count in self._counts(player.name for player in self.players).items() if count > 1]
+        duplicate_ids = [
+            player_id for player_id, count in self._counts(player.player_id for player in self.players).items() if count > 1
+        ]
+        duplicate_slots = [
+            slot for slot, count in self._counts(player.slot_index for player in self.players).items() if count > 1
+        ]
+        if duplicate_names:
+            raise ValueError(f"duplicate player names in config: {duplicate_names}")
+        if duplicate_ids:
+            raise ValueError(f"duplicate player ids in config: {duplicate_ids}")
+        if duplicate_slots:
+            raise ValueError(f"duplicate player slots in config: {duplicate_slots}")
+        if self.main_host_name not in self.players_by_name:
+            raise ValueError(f"main host {self.main_host_name!r} is not configured as a player")
+        if self.sub_host_name not in self.players_by_name:
+            raise ValueError(f"sub host {self.sub_host_name!r} is not configured as a player")
+        if self.advertise_host_name not in self.players_by_name:
+            raise ValueError(f"advertise host {self.advertise_host_name!r} is not configured as a player")
+
+    @staticmethod
+    def _counts(values: Iterable[object]) -> dict[object, int]:
+        counts: dict[object, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return counts
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -503,7 +594,7 @@ class StarCraftHostServer:
             host_name=self.host_name,
             stat_string=self.stat_string,
             current_players=self._advertised_player_count(current_players),
-            max_players=2,
+            max_players=self.max_players,
             state=self._advertised_state(),
         ).to_wire()
 
@@ -511,14 +602,13 @@ class StarCraftHostServer:
         return len([s for s in self.sessions.values() if s.joined])
 
     def _advertised_state(self) -> int:
-        return 0 if self._real_player_count() < 2 and not self.starting and not self.started else 0x0E
+        return 0 if self._real_player_count() < self.max_players and not self.starting and not self.started else 0x0E
 
-    @staticmethod
-    def _advertised_player_count(real_players: int) -> int:
+    def _advertised_player_count(self, real_players: int) -> int:
         # StarCraft LAN listings appear to require at least one player in the
         # room advertisement. A true dedicated host has no real player yet, so
         # advertise the virtual room owner as one occupant while the game is open.
-        return max(1, min(real_players, 2))
+        return max(1, min(real_players, self.max_players))
 
     def handle_storm(self, data: bytes, addr: Address) -> None:
         try:
@@ -935,17 +1025,19 @@ class StarCraftHostServer:
             LOG.info("REQUESTJOIN2 from player=%s", session.player_id)
         elif packet.command == CMD_ENTER:
             name = parse_enter_payload(packet.payload)
-            slot_index = self._slot_index_for_name(name)
-            if slot_index is None:
-                self._reject_enter(session, name, "name is not configured for this 1v1 room")
+            player_config = self._player_config_for_name(name)
+            if player_config is None:
+                self._reject_enter(session, name, "name is not configured for this room")
                 return
+            slot_index = player_config.slot_index
             if self._slot_taken(slot_index, except_session=session):
                 self._reject_enter(session, name, "configured slot is already occupied")
                 return
             session.name = name
             session.slot_index = slot_index
-            session.reliable.player_id = self._player_id_for_slot(slot_index)
-            session.team = slot_index + 1
+            session.reliable.player_id = player_config.player_id
+            session.team = player_config.team
+            session.race = player_config.race
             session.joined = True
             self._mark_lobby_activity(session)
             LOG.info("ENTER from player=%s name=%r slot=%s", session.player_id, session.name, session.slot_index)
@@ -992,7 +1084,7 @@ class StarCraftHostServer:
             length if length is not None else "-",
             request_value if request_value is not None else "-",
             file_position if file_position is not None else "-",
-            DEFAULT_MAP_SIZE,
+            self.map_size,
             session.lobby_ready,
             session.map_percent,
         )
@@ -1000,7 +1092,7 @@ class StarCraftHostServer:
         if not session.joined:
             return
         if kind == 0x0000:
-            if file_position is not None and file_position >= DEFAULT_MAP_SIZE:
+            if file_position is not None and file_position >= self.map_size:
                 session.map_percent = 100
                 self._mark_lobby_activity(session)
                 if not session.post_map_slot_state_sent:
@@ -1016,7 +1108,7 @@ class StarCraftHostServer:
                         "queued post-map MAPPERCENT/SLOTUPDATE/NEWNETPLAYER to player=%s file_position=%s map_size=%s ready=%s",
                         session.player_id,
                         file_position,
-                        DEFAULT_MAP_SIZE,
+                        self.map_size,
                         session.lobby_ready,
                     )
                 else:
@@ -1024,7 +1116,7 @@ class StarCraftHostServer:
                         "post-map slot state already sent to player=%s file_position=%s map_size=%s ready=%s",
                         session.player_id,
                         file_position,
-                        DEFAULT_MAP_SIZE,
+                        self.map_size,
                         session.lobby_ready,
                     )
                 return
@@ -1033,20 +1125,24 @@ class StarCraftHostServer:
                 session.map_bootstrap_sent = True
                 session.reliable.send(
                     CLS_ASYNC,
-                    payload=map_info_payload(self.map_name),
+                    payload=map_info_payload(
+                        self.map_name,
+                        map_size=self.map_size,
+                        map_checksum=self.map_checksum,
+                    ),
                     player_id=self._host_player_id_for(session),
                 )
                 LOG.info(
                     "resent MAP info to player=%s file_position=%s map_size=%s",
                     session.player_id,
                     file_position if file_position is not None else "-",
-                    DEFAULT_MAP_SIZE,
+                    self.map_size,
                 )
             LOG.warning(
                 "MAP transfer requested but map block sending is not implemented player=%s file_position=%s map_size=%s",
                 session.player_id,
                 file_position if file_position is not None else "-",
-                DEFAULT_MAP_SIZE,
+                self.map_size,
             )
             return
         LOG.debug("ignoring unsupported MAP event from player=%s kind=%s length=%s", session.player_id, kind, length)
@@ -1098,7 +1194,7 @@ class StarCraftHostServer:
         existing = self.sessions.get(addr)
         if existing is not None:
             return existing
-        if len(self.sessions) >= 2 or self.storm_transport is None:
+        if len(self.sessions) >= self.max_players or self.storm_transport is None:
             return None
         reliable = ReliableState(addr, UNKNOWN_PLAYER_ID, self.storm_transport)
         reliable.next_send[CLS_SYNC] = self.room_sync_next_send
@@ -1121,10 +1217,11 @@ class StarCraftHostServer:
         self.sessions.pop(session.address, None)
 
     def _slot_index_for_name(self, name: str) -> int | None:
-        for slot_index, configured_name in enumerate(self.player_slot_names):
-            if name == configured_name:
-                return slot_index
-        return None
+        player = self.players_by_name.get(name)
+        return player.slot_index if player else None
+
+    def _player_config_for_name(self, name: str) -> ConfiguredPlayer | None:
+        return self.players_by_name.get(name)
 
     def _slot_taken(self, slot_index: int, *, except_session: PlayerSession | None = None) -> bool:
         return any(
@@ -1133,21 +1230,29 @@ class StarCraftHostServer:
         )
 
     def _is_main_host_session(self, session: PlayerSession) -> bool:
-        return session.slot_index == 0 or session.name == self.main_host_name
+        return session.name == self.main_host_name
 
-    @staticmethod
-    def _player_id_for_slot(slot_index: int) -> int:
-        if 0 <= slot_index < len(PLAYER_IDS_BY_SLOT):
-            return PLAYER_IDS_BY_SLOT[slot_index]
-        return UNKNOWN_PLAYER_ID
+    def _role_name_for(self, session: PlayerSession) -> str:
+        if session.name == self.main_host_name:
+            return "MainHost"
+        if session.name == self.sub_host_name:
+            return "SubHost"
+        return "Player"
+
+    def _player_id_for_slot(self, slot_index: int) -> int:
+        player = self.players_by_slot.get(slot_index)
+        return player.player_id if player else UNKNOWN_PLAYER_ID
 
     def _visible_host_name_for(self, session: PlayerSession) -> str:
-        if self._is_main_host_session(session):
-            return self.sub_host_name
-        return self.main_host_name
+        return self._visible_host_config_for(session).name
 
     def _visible_host_slot_for(self, session: PlayerSession) -> int:
-        return 1 if self._is_main_host_session(session) else 0
+        return self._visible_host_config_for(session).slot_index
+
+    def _visible_host_config_for(self, session: PlayerSession) -> ConfiguredPlayer:
+        if self._is_main_host_session(session):
+            return self.players_by_name[self.sub_host_name]
+        return self.players_by_name[self.main_host_name]
 
     def _host_player_id_for(self, session: PlayerSession) -> int:
         return WIRE_HOST_ID
@@ -1186,6 +1291,7 @@ class StarCraftHostServer:
             session.player_id,
             visible_host_name,
             visible_stat_string,
+            max_players=self.max_players,
             command2_packet_count=command2_packet_count,
             unknown=gamedata_unknown,
             game_uptime_seconds=game_uptime_seconds,
@@ -1204,7 +1310,7 @@ class StarCraftHostServer:
                 f"assigned_player_id={session.player_id} host_storm_id={host_storm_id} "
                 f"visible_host_id={visible_host_id} "
                 f"visible_host_name={visible_host_name!r} "
-                f"role={'MainHost' if self._is_main_host_session(session) else 'SubHost'} "
+                f"role={self._role_name_for(session)} "
                 f"command2_packet_count={command2_packet_count} "
                 f"unknown={gamedata_unknown} game_uptime_seconds={game_uptime_seconds} "
                 f"room_name={self.room_name!r} stat_string={visible_stat_string!r}"
@@ -1240,6 +1346,34 @@ class StarCraftHostServer:
                 f"{record_address[0]}:{record_address[1]}" if record_address is not None else "-",
                 visible_session.address[0],
                 visible_session.address[1],
+                peer_command2,
+            )
+        sent_existing_records = {visible_session.address} if visible_session is not None else set()
+        for existing_session in self.sessions.values():
+            if (
+                existing_session is session
+                or not existing_session.joined
+                or existing_session.address in sent_existing_records
+            ):
+                continue
+            peer_command2 = self._peer_record_command2_for(session, existing_session)
+            record_address = self._send_player_record(
+                session,
+                existing_session,
+                is_host=False,
+                command2_packet_count=peer_command2,
+            )
+            sent_existing_records.add(existing_session.address)
+            LOG.info(
+                "join handshake PLAYER uses existing peer target_player=%s target_name=%r "
+                "record_player_id=%s record_name=%r record_addr=%s real_addr=%s:%s command2_packet_count=%s",
+                session.player_id,
+                session.name,
+                existing_session.player_id,
+                existing_session.name,
+                f"{record_address[0]}:{record_address[1]}" if record_address is not None else "-",
+                existing_session.address[0],
+                existing_session.address[1],
                 peer_command2,
             )
 
@@ -1571,9 +1705,30 @@ class StarCraftHostServer:
             return
         session.lobby_snapshot_sent = True
         host_player_id = self._host_player_id_for(session)
-        session.reliable.send(CLS_ASYNC, payload=roomdata_payload(), player_id=host_player_id)
+        session.reliable.send(
+            CLS_ASYNC,
+            payload=roomdata_payload(
+                tileset=self.roomdata.tileset,
+                width=self.roomdata.width,
+                height=self.roomdata.height,
+                ownr=self.roomdata.ownr,
+                side=self.roomdata.side,
+                ownr_default=self.roomdata.ownr_default,
+                forc=self.roomdata.forc,
+                forc_flags=self.roomdata.forc_flags,
+                race=self.roomdata.race,
+            ),
+            player_id=host_player_id,
+        )
         session.reliable.send(CLS_ASYNC, payload=bytes([SCGP_UNKNOWNREQUEST]), player_id=host_player_id)
-        LOG.info("sent initial ROOMDATA/UNKNOWNREQUEST prompt to player=%s name=%r", session.player_id, session.name)
+        LOG.info(
+            "sent initial ROOMDATA/UNKNOWNREQUEST prompt to player=%s name=%r roomdata=%sx%s tileset=%s",
+            session.player_id,
+            session.name,
+            self.roomdata.width,
+            self.roomdata.height,
+            self.roomdata.tileset,
+        )
 
     def _send_wire_host_record(
         self,
@@ -1714,22 +1869,55 @@ class StarCraftHostServer:
             session.map_bootstrap_sent = True
             session.reliable.send(
                 CLS_ASYNC,
-                payload=map_info_payload(self.map_name),
+                payload=map_info_payload(
+                    self.map_name,
+                    map_size=self.map_size,
+                    map_checksum=self.map_checksum,
+                ),
                 player_id=self._host_player_id_for(session),
             )
-            LOG.info("sent PLAYERJOIN/MAP info to player=%s name=%r", session.player_id, session.name)
+            LOG.info(
+                "sent PLAYERJOIN/MAP info to player=%s name=%r map_name=%r map_size=%s map_checksum=0x%08x",
+                session.player_id,
+                session.name,
+                self.map_name,
+                self.map_size,
+                self.map_checksum,
+            )
 
     def _slot_sync_payload_for(self, session: PlayerSession, *, include_map_percent: bool = True) -> bytes:
-        slot0 = self._game_joined_session_for_slot(0)
-        slot1 = self._game_joined_session_for_slot(1)
+        configured_slot_entries: dict[int, tuple[int, int, int, int, int]] = {}
+        active_net_players: list[tuple[int, int]] = []
+        for player in self.players:
+            slot_session = self._game_joined_session_for_slot(player.slot_index)
+            if slot_session is not None:
+                player_id = player.player_id
+                state = 2
+                race = slot_session.race
+                team = slot_session.team
+                active_net_players.append((player.slot_index, player_id))
+            else:
+                player_id = 0xFF
+                state = 6
+                race = player.race
+                team = player.team
+            configured_slot_entries[player.slot_index] = (player.slot_index, player_id, state, race, team)
+
+        slot_entries: list[tuple[int, int, int, int, int]] = []
+        for slot_index in range(self.max_slots - 1, -1, -1):
+            entry = configured_slot_entries.get(slot_index)
+            if entry is None:
+                race = (self.max_slots - 1 - slot_index) % 3
+                entry = (slot_index, 0xFF, 0, race, 0)
+            slot_entries.append(entry)
+
+        net_player_ids = [
+            player_id for _slot_index, player_id in sorted(active_net_players, key=lambda item: item[0], reverse=True)
+        ]
         return slot_sync_payload(
-            slot0.race if slot0 else 6,
-            slot1.race if slot1 else 6,
-            player0_id=self._player_id_for_slot(0),
-            player1_id=self._player_id_for_slot(1),
-            player0_active=self._slot_active(0),
-            player1_active=self._slot_active(1),
             include_map_percent=include_map_percent,
+            slot_entries=slot_entries,
+            net_player_ids=net_player_ids,
         )
 
     def _send_to_others(self, sender: PlayerSession, cls: int, *, payload: bytes) -> None:
@@ -1800,9 +1988,10 @@ class StarCraftHostServer:
 
     def _ready_to_start(self, *, stable: bool = False) -> bool:
         joined = [session for session in self.sessions.values() if session.joined]
-        if len(joined) != 2:
+        if len(joined) != self.max_players:
             return False
-        if self._session_for_slot(0) is None or self._session_for_slot(1) is None:
+        joined_slots = {session.slot_index for session in joined}
+        if any(player.slot_index not in joined_slots for player in self.players):
             return False
         if not all(session.lobby_ready for session in joined):
             return False
@@ -1989,16 +2178,236 @@ class StarCraftHostServer:
         )
 
 
+def default_roomdata_config() -> RoomDataConfig:
+    return RoomDataConfig(
+        tileset=0,
+        width=0x60,
+        height=0x80,
+        ownr=(6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        side=(6, 6, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0),
+        ownr_default=(6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        forc=(1, 1, 0, 0, 0, 0, 0, 0),
+        forc_flags=(1, 0, 0, 0),
+        race=(1, 1, 0, 0, 0, 0, 0, 0),
+    )
+
+
+def derive_roomdata_for_players(players: Sequence[ConfiguredPlayer]) -> RoomDataConfig:
+    base = default_roomdata_config()
+    ownr = [0] * 12
+    side = [0] * 12
+    ownr_default = [0] * 12
+    forc = [0] * 8
+    race = [0] * 8
+    for player in players:
+        if 0 <= player.slot_index < 12:
+            ownr[player.slot_index] = 6
+            side[player.slot_index] = player.race if player.race != 6 else 6
+            ownr_default[player.slot_index] = 6
+        if 0 <= player.slot_index < 8:
+            forc[player.slot_index] = 1
+            race[player.slot_index] = 1
+    return RoomDataConfig(
+        tileset=base.tileset,
+        width=base.width,
+        height=base.height,
+        ownr=tuple(ownr),
+        side=tuple(side),
+        ownr_default=tuple(ownr_default),
+        forc=tuple(forc),
+        forc_flags=base.forc_flags,
+        race=tuple(race),
+    )
+
+
+def default_server_ini_config() -> ServerIniConfig:
+    roomdata = default_roomdata_config()
+    return ServerIniConfig(
+        main_host_name=DEFAULT_MAIN_HOST_NAME,
+        sub_host_name=DEFAULT_SUB_HOST_NAME,
+        advertise_host_name=DEFAULT_SUB_HOST_NAME,
+        room_name=DEFAULT_ROOM_NAME,
+        map_name=DEFAULT_MAP_FILE_NAME,
+        map_size=DEFAULT_MAP_SIZE,
+        map_checksum=DEFAULT_MAP_CHECKSUM,
+        roomdata=roomdata,
+        players=tuple(ConfiguredPlayer(*values) for values in DEFAULT_PLAYERS),
+    )
+
+
+def _csv_values(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _config_option(
+    parser: configparser.ConfigParser,
+    section: str,
+    names: Sequence[str],
+    fallback: str | None = None,
+) -> str | None:
+    if not parser.has_section(section):
+        return fallback
+    for name in names:
+        if parser.has_option(section, name):
+            value = parser.get(section, name).strip()
+            if value:
+                return value
+    return fallback
+
+
+def _config_int(
+    parser: configparser.ConfigParser,
+    section: str,
+    names: Sequence[str],
+    fallback: int,
+) -> int:
+    value = _config_option(parser, section, names)
+    if value is None:
+        return fallback
+    try:
+        return int(value, 0)
+    except ValueError as exc:
+        joined_names = "/".join(names)
+        raise ValueError(f"invalid integer in [{section}] {joined_names}: {value!r}") from exc
+
+
+def _config_int_list(
+    parser: configparser.ConfigParser,
+    section: str,
+    names: Sequence[str],
+    fallback: Sequence[int],
+    *,
+    length: int,
+) -> tuple[int, ...]:
+    value = _config_option(parser, section, names)
+    if value is None:
+        if len(fallback) != length:
+            raise ValueError(f"default for [{section}] {'/'.join(names)} must contain {length} values")
+        return tuple(fallback)
+    parts = _csv_values(value)
+    if len(parts) != length:
+        raise ValueError(f"[{section}] {'/'.join(names)} must contain {length} comma-separated values")
+    try:
+        return tuple(int(part, 0) & 0xFF for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"invalid integer list in [{section}] {'/'.join(names)}: {value!r}") from exc
+
+
+def _load_roomdata_config(parser: configparser.ConfigParser, fallback: RoomDataConfig) -> RoomDataConfig:
+    return RoomDataConfig(
+        tileset=_config_int(parser, "roomdata", ("tileset",), fallback.tileset),
+        width=_config_int(parser, "roomdata", ("width",), fallback.width),
+        height=_config_int(parser, "roomdata", ("height",), fallback.height),
+        ownr=_config_int_list(parser, "roomdata", ("ownr",), fallback.ownr, length=12),
+        side=_config_int_list(parser, "roomdata", ("side",), fallback.side, length=12),
+        ownr_default=_config_int_list(
+            parser,
+            "roomdata",
+            ("ownr_default", "ownrDefault"),
+            fallback.ownr_default,
+            length=12,
+        ),
+        forc=_config_int_list(parser, "roomdata", ("forc", "force"), fallback.forc, length=8),
+        forc_flags=_config_int_list(parser, "roomdata", ("forc_flags", "force_flags"), fallback.forc_flags, length=4),
+        race=_config_int_list(parser, "roomdata", ("race",), fallback.race, length=8),
+    )
+
+
+def load_server_ini_config(path: str | Path) -> ServerIniConfig:
+    default = default_server_ini_config()
+    config_path = Path(path)
+    if not config_path.exists():
+        return default
+
+    parser = configparser.ConfigParser(interpolation=None)
+    read_files = parser.read(config_path, encoding="utf-8-sig")
+    if not read_files:
+        return default
+
+    room_name = _config_option(parser, "room", ("name", "room_name"), default.room_name) or default.room_name
+    main_host_name = (
+        _config_option(parser, "room", ("main_host", "main_host_name"), default.main_host_name)
+        or default.main_host_name
+    )
+    sub_host_name = (
+        _config_option(parser, "room", ("sub_host", "sub_host_name"), default.sub_host_name)
+        or default.sub_host_name
+    )
+    advertise_host_name = (
+        _config_option(parser, "room", ("advertise_host", "advertise_host_name"), sub_host_name)
+        or sub_host_name
+    )
+
+    map_name = _config_option(parser, "map", ("name", "map_name"), default.map_name) or default.map_name
+    map_size = _config_int(parser, "map", ("size", "map_size"), default.map_size)
+    map_checksum = _config_int(parser, "map", ("checksum", "map_checksum"), default.map_checksum)
+
+    default_players_by_name = {player.name: player for player in default.players}
+    names_value = _config_option(parser, "players", ("names",), "")
+    if names_value:
+        player_names = _csv_values(names_value)
+    else:
+        player_names = [section.split(".", 1)[1] for section in parser.sections() if section.startswith("player.")]
+    if not player_names:
+        roomdata = _load_roomdata_config(parser, default.roomdata)
+        return ServerIniConfig(
+            main_host_name=main_host_name,
+            sub_host_name=sub_host_name,
+            advertise_host_name=advertise_host_name,
+            room_name=room_name,
+            map_name=map_name,
+            map_size=map_size,
+            map_checksum=map_checksum,
+            roomdata=roomdata,
+            players=default.players,
+        )
+
+    players: list[ConfiguredPlayer] = []
+    for index, player_name in enumerate(player_names):
+        section = f"player.{player_name}"
+        fallback = default_players_by_name.get(player_name)
+        player_id = _config_int(parser, section, ("id", "player_id"), fallback.player_id if fallback else index + 1)
+        slot_index = _config_int(parser, section, ("slot", "slot_index"), fallback.slot_index if fallback else index)
+        team = _config_int(parser, section, ("team", "force"), fallback.team if fallback else min(index + 1, 4))
+        race = _config_int(parser, section, ("race",), fallback.race if fallback else 6)
+        players.append(
+            ConfiguredPlayer(
+                name=player_name,
+                player_id=player_id,
+                slot_index=slot_index,
+                team=team,
+                race=race,
+            )
+        )
+
+    roomdata = _load_roomdata_config(parser, derive_roomdata_for_players(players))
+    return ServerIniConfig(
+        main_host_name=main_host_name,
+        sub_host_name=sub_host_name,
+        advertise_host_name=advertise_host_name,
+        room_name=room_name,
+        map_name=map_name,
+        map_size=map_size,
+        map_checksum=map_checksum,
+        roomdata=roomdata,
+        players=tuple(players),
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Experimental StarCraft LAN MainHost/SubHost relay")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="INI file for room, map, and player identities.")
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--discovery-port", type=int, default=6111)
     parser.add_argument("--storm-port", type=int, default=6112)
-    parser.add_argument("--main-host-name", default=DEFAULT_MAIN_HOST_NAME)
-    parser.add_argument("--sub-host-name", default=DEFAULT_SUB_HOST_NAME)
-    parser.add_argument("--room-name", default=DEFAULT_ROOM_NAME)
+    parser.add_argument("--main-host-name", default=None)
+    parser.add_argument("--sub-host-name", default=None)
+    parser.add_argument("--advertise-host-name", default=None)
+    parser.add_argument("--room-name", default=None)
     parser.add_argument("--map-path", default="")
-    parser.add_argument("--map-name", default=DEFAULT_MAP_FILE_NAME)
+    parser.add_argument("--map-name", default=None)
+    parser.add_argument("--map-size", type=lambda value: int(value, 0), default=None)
+    parser.add_argument("--map-checksum", type=lambda value: int(value, 0), default=None)
     parser.add_argument("--auto-start-delay", type=float, default=3.0)
     parser.add_argument("--game-state-delay", type=float, default=0.35)
     parser.add_argument("--seed-delay", type=float, default=5.75)
@@ -2043,14 +2452,38 @@ async def amain(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     configure_logging(args.log_level, args.log_file)
+    config = load_server_ini_config(args.config)
+    main_host_name = args.main_host_name or config.main_host_name
+    sub_host_name = args.sub_host_name or config.sub_host_name
+    advertise_host_name = args.advertise_host_name or config.advertise_host_name
+    room_name = args.room_name or config.room_name
+    map_name = args.map_name or config.map_name
+    map_size = args.map_size if args.map_size is not None else config.map_size
+    map_checksum = args.map_checksum if args.map_checksum is not None else config.map_checksum
+    config_path_exists = Path(args.config).exists()
+    if args.advertise_host_name is None and args.sub_host_name:
+        advertise_host_name = sub_host_name
+    players = config.players
+    roomdata = config.roomdata
+    if not config_path_exists and (args.main_host_name or args.sub_host_name):
+        players = (
+            ConfiguredPlayer(main_host_name, MAIN_HOST_PLAYER_ID, 0, 1, 6),
+            ConfiguredPlayer(sub_host_name, SUB_HOST_PLAYER_ID, 1, 2, 6),
+        )
+        roomdata = derive_roomdata_for_players(players)
     server = StarCraftHostServer(
         bind=args.bind,
         discovery_port=args.discovery_port,
         storm_port=args.storm_port,
-        main_host_name=args.main_host_name,
-        sub_host_name=args.sub_host_name,
-        room_name=args.room_name,
-        map_name=args.map_name,
+        main_host_name=main_host_name,
+        sub_host_name=sub_host_name,
+        advertise_host_name=advertise_host_name,
+        room_name=room_name,
+        map_name=map_name,
+        map_size=map_size,
+        map_checksum=map_checksum,
+        roomdata=roomdata,
+        players=players,
         auto_start_delay=args.auto_start_delay,
         game_state_delay=args.game_state_delay,
         seed_delay=args.seed_delay,
@@ -2062,8 +2495,25 @@ async def amain(argv: list[str] | None = None) -> int:
     )
     if args.log_file:
         LOG.info("writing log file: %s", args.log_file)
+    if config_path_exists:
+        LOG.info("loaded server config: %s", args.config)
+    LOG.info(
+        "room config room=%r map=%r size=%s checksum=0x%08x roomdata=%sx%s tileset=%s "
+        "main_host=%r sub_host=%r advertise_host=%r players=%s",
+        room_name,
+        map_name,
+        map_size,
+        map_checksum,
+        roomdata.width,
+        roomdata.height,
+        roomdata.tileset,
+        main_host_name,
+        sub_host_name,
+        advertise_host_name,
+        ", ".join(f"{player.name}:id{player.player_id}/slot{player.slot_index}" for player in players),
+    )
     if args.map_path:
-        LOG.info("map path configured: %s (metadata remains fixed to capture constants)", args.map_path)
+        LOG.info("map path configured: %s (metadata is taken from config/args)", args.map_path)
     await server.start()
     try:
         await server.wait_closed()

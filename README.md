@@ -16,17 +16,16 @@ $env:SC_HOST_PYTHON = "C:\Path\To\python.exe"
 .\start_host.ps1
 ```
 
-The first version is intentionally narrow:
+The current prototype is intentionally narrow:
 
 - `SEXP / 0xC3`
 - UDP `6111` room discovery and UDP `6112` Storm traffic
-- fixed 1v1 room
-- stable player ids: `Sun` is player `1`, `SunX` is player `2`; Storm host/control sender id stays `0`
+- player identities, slots, and map metadata are read from `sc_host.ini`
+- default sample config: `Sun` is player `1`, `SunX` is player `2`, `SunY` is player `3`; Storm host/control sender id stays `0`
 - MainHost/SubHost view: host identity is expressed with the `PLAYER` host flag and creator metadata
-- fixed Challenger room/map metadata
 - central relay: real clients talk to Python, not to each other
 - periodic LAN room advertisements, plus replies to client search broadcasts
 
 This is a protocol prototype, not a hardened production server. The game logic is
 not simulated; once in game, the service relays `CLS=2` command payloads between
-the two clients.
+the clients.

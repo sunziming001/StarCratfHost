@@ -2,10 +2,12 @@ param(
     [string]$Bind = "0.0.0.0",
     [int]$DiscoveryPort = 6111,
     [int]$StormPort = 6112,
-    [string]$RoomName = "Challenger",
-    [string]$MapPath = "maps/(2)Challenger.scm",
-    [string]$MainHostName = "Sun",
-    [string]$SubHostName = "SunX",
+    [string]$Config = "sc_host.ini",
+    [string]$RoomName = "",
+    [string]$MapPath = "",
+    [string]$MainHostName = "",
+    [string]$SubHostName = "",
+    [string]$AdvertiseHostName = "",
     [double]$AutoStartDelay = 3,
     [double]$GameStateDelay = 0.35,
     [double]$SeedDelay = 5.75,
@@ -35,13 +37,10 @@ $PythonExe = $env:SC_HOST_PYTHON
 
 $ArgsList = @(
     "-m", "sc_host",
+    "--config", $Config,
     "--bind", $Bind,
     "--discovery-port", $DiscoveryPort,
     "--storm-port", $StormPort,
-    "--room-name", $RoomName,
-    "--map-path", $MapPath,
-    "--main-host-name", $MainHostName,
-    "--sub-host-name", $SubHostName,
     "--auto-start-delay", $AutoStartDelay,
     "--game-state-delay", $GameStateDelay,
     "--seed-delay", $SeedDelay,
@@ -50,6 +49,26 @@ $ArgsList = @(
     "--log-level", $LogLevel,
     "--log-file", $LogFile
 )
+
+if ($RoomName) {
+    $ArgsList += @("--room-name", $RoomName)
+}
+
+if ($MapPath) {
+    $ArgsList += @("--map-path", $MapPath)
+}
+
+if ($MainHostName) {
+    $ArgsList += @("--main-host-name", $MainHostName)
+}
+
+if ($SubHostName) {
+    $ArgsList += @("--sub-host-name", $SubHostName)
+}
+
+if ($AdvertiseHostName) {
+    $ArgsList += @("--advertise-host-name", $AdvertiseHostName)
+}
 
 if ($TraceGame) {
     $ArgsList += "--trace-game"
@@ -70,6 +89,7 @@ $ArgsList += $ExtraArgs
 Write-Host "Starting StarCraft LAN host relay..."
 Write-Host "Root: $Root"
 Write-Host "Python: $PythonExe"
+Write-Host "Config: $Config"
 
 & $PythonExe @PrefixArgs @ArgsList
 exit $LASTEXITCODE

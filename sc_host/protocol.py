@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import socket
 import struct
 import time
+from typing import Sequence
 
 from .checksum import PacketError, unwrap_body, wrap_body
 
@@ -143,23 +144,43 @@ def parse_enter_payload(payload: bytes) -> str:
     return c_string(payload) or "Player"
 
 
-def roomdata_payload(slot0_force: int = 1, slot1_force: int = 1) -> bytes:
-    payload = bytearray(bytes.fromhex(
-        "4a 00 00 60 00 80 00"
-        " 06 06 00 00 00 00 00 00 00 00 00 00"
-        " 06 06 02 01 00 02 01 00 00 00 00 00"
-        " 06 06 00 00 00 00 00 00 00 00 00 00"
-        " 00 00 00 00"
-        " 00 00 00 00 01 00 00 00"
-        " 01 01 00 00 00 00 00 00"
-    ))
-    # Challenger's LAN ROOMDATA capture uses force=1 for the first two active
-    # slots. This differs from the raw CHK FORC section, so prefer the wire
-    # value observed in the client/host capture.
-    force_offset = 1 + 2 + 2 + 2 + 12 + 12 + 12
-    payload[force_offset] = slot0_force & 0xFF
-    payload[force_offset + 1] = slot1_force & 0xFF
-    return bytes(payload)
+def _roomdata_bytes(values: Sequence[int] | None, fallback: Sequence[int], length: int) -> bytes:
+    source = fallback if values is None else values
+    if len(source) != length:
+        raise ValueError(f"ROOMDATA field must contain {length} values, got {len(source)}")
+    return bytes(value & 0xFF for value in source)
+
+
+def roomdata_payload(
+    slot0_force: int = 1,
+    slot1_force: int = 1,
+    *,
+    tileset: int = 0,
+    width: int = 0x60,
+    height: int = 0x80,
+    ownr: Sequence[int] | None = None,
+    side: Sequence[int] | None = None,
+    ownr_default: Sequence[int] | None = None,
+    forc: Sequence[int] | None = None,
+    forc_flags: Sequence[int] | None = None,
+    race: Sequence[int] | None = None,
+) -> bytes:
+    default_ownr = (6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    default_side = (6, 6, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0)
+    default_ownr_default = (6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    default_forc = (slot0_force & 0xFF, slot1_force & 0xFF, 0, 0, 0, 0, 0, 0)
+    default_forc_flags = (1, 0, 0, 0)
+    default_race = (1, 1, 0, 0, 0, 0, 0, 0)
+    return (
+        bytes([SCGP_ROOMDATA])
+        + struct.pack("<HHH", tileset & 0xFFFF, width & 0xFFFF, height & 0xFFFF)
+        + _roomdata_bytes(ownr, default_ownr, 12)
+        + _roomdata_bytes(side, default_side, 12)
+        + _roomdata_bytes(ownr_default, default_ownr_default, 12)
+        + _roomdata_bytes(forc, default_forc, 8)
+        + _roomdata_bytes(forc_flags, default_forc_flags, 4)
+        + _roomdata_bytes(race, default_race, 8)
+    )
 
 
 def forcenames_payload(names: tuple[str, str, str, str] = ("Team 1", "Team 2", "Team 3", "Team 4")) -> bytes:
@@ -244,9 +265,14 @@ def playerjoin_payload(player_id: int) -> bytes:
     return bytes([SCGP_PLAYERJOIN]) + struct.pack("<I", player_id)
 
 
-def map_info_payload(map_name: str = DEFAULT_MAP_FILE_NAME) -> bytes:
+def map_info_payload(
+    map_name: str = DEFAULT_MAP_FILE_NAME,
+    *,
+    map_size: int = DEFAULT_MAP_SIZE,
+    map_checksum: int = DEFAULT_MAP_CHECKSUM,
+) -> bytes:
     name = map_name.encode("latin1", "replace") + b"\0"
-    event_body = struct.pack("<II", DEFAULT_MAP_SIZE, DEFAULT_MAP_CHECKSUM) + name
+    event_body = struct.pack("<II", map_size & 0xFFFFFFFF, map_checksum & 0xFFFFFFFF) + name
     return bytes([SCGP_MAP]) + struct.pack("<HH", len(event_body) + 2, 0x0001) + event_body
 
 
@@ -282,7 +308,18 @@ def slot_sync_payload(
     player1_team: int = 2,
     include_map_percent: bool = True,
     include_virtual_host: bool = False,
+    slot_entries: Sequence[tuple[int, int, int, int, int]] | None = None,
+    net_player_ids: Sequence[int] | None = None,
 ) -> bytes:
+    if slot_entries is not None:
+        parts = [slot_update(slot, player, state, race, team) for slot, player, state, race, team in slot_entries]
+        parts.extend(new_net_player(player_id) for player_id in (net_player_ids or ()))
+        if include_virtual_host:
+            parts.append(new_net_player(0))
+        if include_map_percent:
+            parts.insert(0, map_percent_payload(100))
+        return b"".join(parts)
+
     slot0_player = player0_id if player0_active else 0xFF
     slot1_player = player1_id if player1_active else 0xFF
     slot0_state = 2 if player0_active else 6
