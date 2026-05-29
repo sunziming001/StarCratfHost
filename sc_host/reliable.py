@@ -51,6 +51,26 @@ class ReliableState:
             self.next_send[cls] = (seq_send + 1) & 0xFFFF
         return wire
 
+    def send_at_seq(
+        self,
+        cls: int,
+        seq_send: int,
+        *,
+        command: int = 0,
+        payload: bytes = b"",
+        player_id: int = 0,
+        status: int = STATUS_NORMAL,
+    ) -> bytes:
+        seq_recv = self.last_recv.get(cls, 0)
+        packet = StormPacket(seq_send, seq_recv, cls, command, player_id, status, payload)
+        wire = packet.to_wire()
+        self.transport.sendto(wire, self.address)
+        _log_protocol_storm("tx", packet, self.address, event="send")
+        self._store(cls, seq_send, wire)
+        if status == STATUS_NORMAL:
+            self.next_send[cls] = (seq_send + 1) & 0xFFFF
+        return wire
+
     def resend(self, cls: int, seq: int) -> bool:
         wire = self.history.get(cls, {}).get(seq)
         if wire is None:

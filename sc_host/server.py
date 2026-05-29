@@ -90,8 +90,10 @@ JOIN_BOOTSTRAP_SYNC_NOP_COUNT = 2
 class ResendRequestContext:
     session: PlayerSession
     packet: StormPacket
+    wire: bytes
     header_requested_seq: int
     payload_requested_seq: int | str
+    payload_context_player_id: int | str
     chosen_requested_seq: int
     chosen_source: str
     payload_head: str
@@ -101,6 +103,20 @@ class ResendRequestContext:
     history_min: int | str
     history_max: int | str
     history_tail: str
+
+
+@dataclass
+class PeerRelayRoute:
+    viewer_address: Address
+    viewer_player_id: int
+    viewer_name: str
+    subject_address: Address
+    subject_player_id: int
+    subject_name: str
+    advertised_address: Address
+    sock: socket.socket
+    transport: asyncio.DatagramTransport | None = None
+    attach_task: asyncio.Task[None] | None = None
 
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
@@ -127,6 +143,21 @@ class StormProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: Address) -> None:
         self.server.handle_storm(data, addr)
+
+
+class PeerRelayProtocol(asyncio.DatagramProtocol):
+    def __init__(self, server: "StarCraftHostServer", route: PeerRelayRoute) -> None:
+        self.server = server
+        self.route = route
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.route.transport = transport  # type: ignore[assignment]
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.route.transport = None
+
+    def datagram_received(self, data: bytes, addr: Address) -> None:
+        self.server.handle_peer_relay(self.route, data, addr)
 
 
 class StarCraftHostServer:
@@ -175,6 +206,11 @@ class StarCraftHostServer:
         self.discovery_transport: asyncio.DatagramTransport | None = None
         self.storm_transport: asyncio.DatagramTransport | None = None
         self.sessions: dict[Address, PlayerSession] = {}
+        self.peer_relay_routes: dict[tuple[Address, Address], PeerRelayRoute] = {}
+        self._peer_relay_attach_tasks: set[asyncio.Task[None]] = set()
+        self._local_ip_cache: dict[str, str] = {}
+        self.room_sync_next_send = 100
+        self.room_last_sync_tick_sent = 0.0
         self.starting = False
         self.started = False
         self.closed = False
@@ -217,6 +253,7 @@ class StarCraftHostServer:
             self._start_nop_task.cancel()
         if self._advertise_task:
             self._advertise_task.cancel()
+        await self._close_all_peer_relays()
         if self.discovery_transport:
             self.discovery_transport.close()
         if self.storm_transport:
@@ -230,6 +267,181 @@ class StarCraftHostServer:
         sock.bind((self.bind, port))
         sock.setblocking(False)
         return sock
+
+    def _local_ip_for_peer(self, peer_address: Address) -> str:
+        if self.bind not in ("", "0.0.0.0", "::"):
+            return self.bind
+        cached = self._local_ip_cache.get(peer_address[0])
+        if cached:
+            return cached
+        local_ip = "127.0.0.1"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(peer_address)
+                candidate = probe.getsockname()[0]
+                if candidate and candidate != "0.0.0.0":
+                    local_ip = candidate
+        except OSError:
+            try:
+                local_ip = socket.gethostbyname(socket.gethostname())
+            except OSError:
+                pass
+        self._local_ip_cache[peer_address[0]] = local_ip
+        return local_ip
+
+    def _relay_address_for(self, viewer: PlayerSession, subject: PlayerSession) -> Address:
+        route = self._ensure_peer_relay_route(viewer, subject)
+        self._ensure_peer_relay_route(subject, viewer)
+        return route.advertised_address
+
+    def _ensure_peer_relay_route(self, viewer: PlayerSession, subject: PlayerSession) -> PeerRelayRoute:
+        key = (viewer.address, subject.address)
+        existing = self.peer_relay_routes.get(key)
+        if existing is not None:
+            return existing
+
+        sock = self._make_socket(0, broadcast=False)
+        port = sock.getsockname()[1]
+        advertised_address = (self._local_ip_for_peer(viewer.address), port)
+        route = PeerRelayRoute(
+            viewer_address=viewer.address,
+            viewer_player_id=viewer.player_id,
+            viewer_name=viewer.name,
+            subject_address=subject.address,
+            subject_player_id=subject.player_id,
+            subject_name=subject.name,
+            advertised_address=advertised_address,
+            sock=sock,
+        )
+        self.peer_relay_routes[key] = route
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(self._attach_peer_relay_route(key))
+        route.attach_task = task
+        self._peer_relay_attach_tasks.add(task)
+        task.add_done_callback(self._peer_relay_attach_done)
+        LOG.info(
+            "created peer relay viewer_player=%s viewer_name=%r subject_player=%s subject_name=%r "
+            "advertised=%s:%s subject_real=%s:%s",
+            viewer.player_id,
+            viewer.name,
+            subject.player_id,
+            subject.name,
+            advertised_address[0],
+            advertised_address[1],
+            subject.address[0],
+            subject.address[1],
+        )
+        return route
+
+    async def _attach_peer_relay_route(self, key: tuple[Address, Address]) -> None:
+        route = self.peer_relay_routes.get(key)
+        if route is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.create_datagram_endpoint(lambda: PeerRelayProtocol(self, route), sock=route.sock)
+
+    def _peer_relay_attach_done(self, task: asyncio.Task[None]) -> None:
+        self._peer_relay_attach_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            LOG.warning("peer relay attach failed: %s", exc)
+
+    def _close_peer_relay_route(self, key: tuple[Address, Address]) -> None:
+        route = self.peer_relay_routes.pop(key, None)
+        if route is None:
+            return
+        if route.attach_task is not None and not route.attach_task.done():
+            route.attach_task.cancel()
+        if route.transport is not None:
+            route.transport.close()
+        else:
+            route.sock.close()
+        LOG.info(
+            "closed peer relay viewer_player=%s subject_player=%s advertised=%s:%s",
+            route.viewer_player_id,
+            route.subject_player_id,
+            route.advertised_address[0],
+            route.advertised_address[1],
+        )
+
+    def _close_peer_relays_for(self, session: PlayerSession) -> None:
+        for key in list(self.peer_relay_routes):
+            if session.address in key:
+                self._close_peer_relay_route(key)
+
+    async def _close_all_peer_relays(self) -> None:
+        tasks = [task for task in self._peer_relay_attach_tasks if not task.done()]
+        for key in list(self.peer_relay_routes):
+            self._close_peer_relay_route(key)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._peer_relay_attach_tasks.clear()
+
+    def handle_peer_relay(self, route: PeerRelayRoute, data: bytes, addr: Address) -> None:
+        if addr != route.viewer_address:
+            LOG.debug(
+                "dropping peer relay packet from unexpected addr=%s:%s expected_viewer=%s:%s "
+                "subject_player=%s len=%s",
+                addr[0],
+                addr[1],
+                route.viewer_address[0],
+                route.viewer_address[1],
+                route.subject_player_id,
+                len(data),
+            )
+            return
+        viewer = self.sessions.get(route.viewer_address)
+        subject = self.sessions.get(route.subject_address)
+        if viewer is None or subject is None:
+            LOG.debug(
+                "dropping peer relay packet because session is gone viewer_player=%s subject_player=%s len=%s",
+                route.viewer_player_id,
+                route.subject_player_id,
+                len(data),
+            )
+            return
+        reverse = self.peer_relay_routes.get((route.subject_address, route.viewer_address))
+        if reverse is None:
+            LOG.warning(
+                "dropping peer relay packet without reverse route viewer_player=%s subject_player=%s len=%s",
+                route.viewer_player_id,
+                route.subject_player_id,
+                len(data),
+            )
+            return
+        try:
+            if reverse.transport is not None:
+                reverse.transport.sendto(data, route.subject_address)
+            else:
+                reverse.sock.sendto(data, route.subject_address)
+        except OSError as exc:
+            LOG.warning(
+                "peer relay send failed from_player=%s to_player=%s len=%s error=%s",
+                viewer.player_id,
+                subject.player_id,
+                len(data),
+                exc,
+            )
+            return
+        if self.trace_game:
+            try:
+                packet = StormPacket.from_wire(data)
+            except PacketError:
+                packet = None
+            if packet is not None:
+                self._trace_game_packet("relay-rx", viewer, packet=packet)
+        LOG.debug(
+            "peer relay forwarded from_player=%s to_player=%s via=%s:%s source_for_subject=%s:%s len=%s",
+            viewer.player_id,
+            subject.player_id,
+            route.advertised_address[0],
+            route.advertised_address[1],
+            reverse.advertised_address[0],
+            reverse.advertised_address[1],
+            len(data),
+        )
 
     @staticmethod
     def _default_broadcast_addresses(bind: str) -> list[str]:
@@ -321,7 +533,7 @@ class StarCraftHostServer:
             session.reliable.note_recv(packet)
 
         if packet.status == STATUS_RESEND_REQUEST:
-            self._handle_resend_request(session, packet)
+            self._handle_resend_request(session, packet, data)
             return
         if packet.status == STATUS_VERIFY:
             self._handle_verify(session, packet)
@@ -350,10 +562,12 @@ class StarCraftHostServer:
         if packet.cls == CLS_CONTROL and session.joined and not session.lobby_snapshot_sent:
             self._maybe_send_lobby_snapshot_after_join_ack(session, packet, source="client CONTROL VERIFY")
 
-    def _handle_resend_request(self, session: PlayerSession | None, packet: StormPacket) -> None:
+    def _handle_resend_request(self, session: PlayerSession | None, packet: StormPacket, wire: bytes) -> None:
         if session is None:
             return
-        context = self._resend_context(session, packet)
+        context = self._resend_context(session, packet, wire)
+        if self._forward_sync_resend_for_peer_context(context):
+            return
         if context.chosen_requested_seq == context.next_send:
             self._handle_next_send_resend(context)
             return
@@ -362,10 +576,21 @@ class StarCraftHostServer:
             return
         self._send_resend_verify(context)
 
-    def _resend_context(self, session: PlayerSession, packet: StormPacket) -> ResendRequestContext:
+    def _resend_context(self, session: PlayerSession, packet: StormPacket, wire: bytes) -> ResendRequestContext:
         header_requested_seq = packet.seq_recv
         payload_requested_seq: int | str = "-"
-        if len(packet.payload) >= 2:
+        payload_context_player_id: int | str = "-"
+        if packet.cls == CLS_SYNC:
+            # Public docs and captures show CLS_SYNC resend payload may carry a
+            # player/callback context byte. The missing sequence is the Storm
+            # header's Seq2, not payload[0:2].
+            seq = header_requested_seq
+            chosen_source = "header.seq_recv"
+            if packet.payload:
+                payload_context_player_id = packet.payload[0]
+            if len(packet.payload) >= 2:
+                payload_requested_seq = struct.unpack_from("<H", packet.payload, 0)[0]
+        elif len(packet.payload) >= 2:
             payload_requested_seq = struct.unpack_from("<H", packet.payload, 0)[0]
             seq = payload_requested_seq
             chosen_source = "payload[0:2]"
@@ -374,13 +599,15 @@ class StarCraftHostServer:
             chosen_source = "header.seq_recv"
         history_count, history_min, history_max, history_tail = self._resend_history_summary(session.reliable, packet.cls)
         payload_head = packet.payload[:64].hex(" ") or "-"
-        next_send = session.reliable.next_send.get(packet.cls, 0)
+        next_send = self.room_sync_next_send if packet.cls == CLS_SYNC else session.reliable.next_send.get(packet.cls, 0)
         last_recv = session.reliable.last_recv.get(packet.cls, 0)
         return ResendRequestContext(
             session=session,
             packet=packet,
+            wire=wire,
             header_requested_seq=header_requested_seq,
             payload_requested_seq=payload_requested_seq,
+            payload_context_player_id=payload_context_player_id,
             chosen_requested_seq=seq,
             chosen_source=chosen_source,
             payload_head=payload_head,
@@ -392,6 +619,84 @@ class StarCraftHostServer:
             history_tail=history_tail,
         )
 
+    def _forward_sync_resend_for_peer_context(self, context: ResendRequestContext) -> bool:
+        packet = context.packet
+        session = context.session
+        context_player_id = context.payload_context_player_id
+        if packet.cls != CLS_SYNC or not isinstance(context_player_id, int):
+            return False
+        if context_player_id in (WIRE_HOST_ID, UNKNOWN_PLAYER_ID, session.player_id):
+            return False
+
+        target = self._session_for_player_id(context_player_id)
+        if target is None or not target.joined:
+            LOG.debug(
+                "SYNC resend has peer context but target is unavailable; sending verify instead of host history "
+                "player=%s target_player=%s "
+                "seq_send=%s seq_recv=%s payload_len=%s payload_head=%s chosen_requested_seq=%s "
+                "history_count=%s history_min=%s history_max=%s history_tail=%s",
+                session.player_id,
+                context_player_id,
+                packet.seq_send,
+                packet.seq_recv,
+                len(packet.payload),
+                context.payload_head,
+                context.chosen_requested_seq,
+                context.history_count,
+                context.history_min,
+                context.history_max,
+                context.history_tail,
+            )
+            self._send_resend_verify(context)
+            return True
+
+        self._ensure_peer_relay_route(session, target)
+        reverse = self._ensure_peer_relay_route(target, session)
+        try:
+            if reverse.transport is not None:
+                reverse.transport.sendto(context.wire, target.address)
+            else:
+                reverse.sock.sendto(context.wire, target.address)
+        except OSError as exc:
+            LOG.warning(
+                "failed to forward SYNC resend peer context from_player=%s to_player=%s "
+                "source_for_target=%s:%s seq_send=%s seq_recv=%s payload_head=%s; sending verify error=%s",
+                session.player_id,
+                target.player_id,
+                reverse.advertised_address[0],
+                reverse.advertised_address[1],
+                packet.seq_send,
+                packet.seq_recv,
+                context.payload_head,
+                exc,
+            )
+            self._send_resend_verify(context)
+            return True
+
+        LOG.debug(
+            "forwarded SYNC resend peer context from_player=%s to_player=%s source_for_target=%s:%s "
+            "seq_send=%s seq_recv=%s chosen_requested_seq=%s chosen_source=%s "
+            "payload_context_player_id=%s payload_requested_seq=%s payload_len=%s payload_head=%s "
+            "main_history_count=%s main_history_min=%s main_history_max=%s main_history_tail=%s",
+            session.player_id,
+            target.player_id,
+            reverse.advertised_address[0],
+            reverse.advertised_address[1],
+            packet.seq_send,
+            packet.seq_recv,
+            context.chosen_requested_seq,
+            context.chosen_source,
+            context.payload_context_player_id,
+            context.payload_requested_seq,
+            len(packet.payload),
+            context.payload_head,
+            context.history_count,
+            context.history_min,
+            context.history_max,
+            context.history_tail,
+        )
+        return True
+
     def _handle_next_send_resend(self, context: ResendRequestContext) -> None:
         session = context.session
         packet = context.packet
@@ -400,6 +705,7 @@ class StarCraftHostServer:
                 "resend request matched next_send; no history resend for player=%s cls=%s status=%s "
                 "command=0x%02x storm_pid=%s seq_send=%s seq_recv=%s payload_len=%s payload_head=%s "
                 "chosen_requested_seq=%s chosen_source=%s header_requested_seq=%s payload_requested_seq=%s "
+                "payload_context_player_id=%s "
                 "next_send=%s last_recv=%s history_count=%s history_min=%s history_max=%s history_tail=%s",
                 session.player_id,
                 packet.cls,
@@ -414,6 +720,7 @@ class StarCraftHostServer:
                 context.chosen_source,
                 context.header_requested_seq,
                 context.payload_requested_seq,
+                context.payload_context_player_id,
                 context.next_send,
                 context.last_recv,
                 context.history_count,
@@ -441,7 +748,7 @@ class StarCraftHostServer:
                 LOG.debug(
                     "resend request matched next_send; throttled sync tick for player=%s cls=%s "
                     "seq_send=%s seq_recv=%s chosen_requested_seq=%s next_send=%s last_recv=%s "
-                    "throttled_count=%s throttle_ms=%s last_sync_age_ms=%s "
+                    "payload_context_player_id=%s throttled_count=%s throttle_ms=%s last_sync_age_ms=%s "
                     "history_count=%s history_min=%s history_max=%s history_tail=%s",
                     session.player_id,
                     packet.cls,
@@ -450,6 +757,7 @@ class StarCraftHostServer:
                     context.chosen_requested_seq,
                     context.next_send,
                     context.last_recv,
+                    context.payload_context_player_id,
                     throttled,
                     int(RESEND_NEXT_SEND_SYNC_INTERVAL * 1000),
                     last_sync_age_ms,
@@ -470,6 +778,7 @@ class StarCraftHostServer:
             "resend request matched next_send; sent sync tick packet for player=%s cls=%s status=%s "
             "command=0x%02x storm_pid=%s seq_send=%s seq_recv=%s payload_len=%s payload_head=%s "
             "chosen_requested_seq=%s chosen_source=%s header_requested_seq=%s payload_requested_seq=%s "
+            "payload_context_player_id=%s "
             "sent_seq=%s sent_source=%s old_next_send=%s new_next_send=%s last_recv=%s throttled_since_last_send=%s "
             "throttle_ms=%s "
             "history_count=%s history_min=%s history_max=%s history_tail=%s "
@@ -487,6 +796,7 @@ class StarCraftHostServer:
             context.chosen_source,
             context.header_requested_seq,
             context.payload_requested_seq,
+            context.payload_context_player_id,
             sent_seq,
             sent_source,
             context.next_send,
@@ -511,6 +821,7 @@ class StarCraftHostServer:
             "resent packet for player=%s cls=%s status=%s command=0x%02x storm_pid=%s "
             "seq_send=%s seq_recv=%s payload_len=%s payload_head=%s "
             "chosen_requested_seq=%s chosen_source=%s header_requested_seq=%s payload_requested_seq=%s "
+            "payload_context_player_id=%s "
             "history_count=%s history_min=%s history_max=%s history_tail=%s",
             session.player_id,
             packet.cls,
@@ -525,6 +836,7 @@ class StarCraftHostServer:
             context.chosen_source,
             context.header_requested_seq,
             context.payload_requested_seq,
+            context.payload_context_player_id,
             context.history_count,
             context.history_min,
             context.history_max,
@@ -540,6 +852,7 @@ class StarCraftHostServer:
             "missing resend history; sent verify for player=%s cls=%s status=%s command=0x%02x storm_pid=%s "
             "seq_send=%s seq_recv=%s payload_len=%s payload_head=%s "
             "chosen_requested_seq=%s chosen_source=%s header_requested_seq=%s payload_requested_seq=%s "
+            "payload_context_player_id=%s "
             "verify_seq=%s next_send=%s last_recv=%s "
             "history_count=%s history_min=%s history_max=%s history_tail=%s",
             session.player_id,
@@ -555,6 +868,7 @@ class StarCraftHostServer:
             context.chosen_source,
             context.header_requested_seq,
             context.payload_requested_seq,
+            context.payload_context_player_id,
             verify_seq,
             context.next_send,
             context.last_recv,
@@ -635,6 +949,7 @@ class StarCraftHostServer:
             session.joined = True
             self._mark_lobby_activity(session)
             LOG.info("ENTER from player=%s name=%r slot=%s", session.player_id, session.name, session.slot_index)
+            self._announce_player_record_to_existing(session)
             self._send_join_handshake(session)
         elif packet.command == CMD_PING:
             session.reliable.send(CLS_CONTROL, command=CMD_PONG, player_id=self._host_player_id_for(session))
@@ -643,7 +958,7 @@ class StarCraftHostServer:
                 session.reliable.send_verify(CLS_CONTROL, player_id=self._host_player_id_for(session))
                 self._note_join_ping_ack(session, packet, source="client PONG")
         elif packet.command == CMD_QUIT:
-            self._disconnect(session, "client quit")
+            self._disconnect(session, "client quit", payload=packet.payload or quit_payload())
 
     def _handle_async(self, packet: StormPacket, addr: Address) -> None:
         session = self.sessions.get(addr)
@@ -691,6 +1006,12 @@ class StarCraftHostServer:
                 if not session.post_map_slot_state_sent:
                     session.post_map_slot_state_sent = True
                     self._send_slot_state(session, source="post-map", include_map_percent=True)
+                    self._broadcast_slot_state(
+                        source=f"player {session.player_id} post-map",
+                        include_map_percent=True,
+                        except_session=session,
+                        ready_only=True,
+                    )
                     LOG.info(
                         "queued post-map MAPPERCENT/SLOTUPDATE/NEWNETPLAYER to player=%s file_position=%s map_size=%s ready=%s",
                         session.player_id,
@@ -780,6 +1101,8 @@ class StarCraftHostServer:
         if len(self.sessions) >= 2 or self.storm_transport is None:
             return None
         reliable = ReliableState(addr, UNKNOWN_PLAYER_ID, self.storm_transport)
+        reliable.next_send[CLS_SYNC] = self.room_sync_next_send
+        reliable.last_recv[CLS_SYNC] = self.room_sync_next_send
         session = PlayerSession(reliable=reliable)
         self.sessions[addr] = session
         return session
@@ -833,10 +1156,15 @@ class StarCraftHostServer:
         return self._game_joined_session_for_slot(slot_index) is not None
 
     def _gamedata_fields_for(self, session: PlayerSession) -> tuple[int, int, int]:
-        command2_packet_count = session.reliable.last_recv.get(CLS_SYNC, 0)
+        command2_packet_count = self.room_sync_next_send
         unknown = 0x06
         game_uptime_seconds = max(0, int(time.monotonic() - self.room_created_at))
         return command2_packet_count, unknown, game_uptime_seconds
+
+    def _peer_record_command2_for(self, target_session: PlayerSession, subject_session: PlayerSession) -> int:
+        # CMD_PLAYER's command2/sync count seeds the peer Storm stream. Real
+        # LAN hosts use the room-wide sync tick here, not a per-client counter.
+        return self.room_sync_next_send
 
     def _send_join_handshake(self, session: PlayerSession) -> None:
         r = session.reliable
@@ -849,7 +1177,8 @@ class StarCraftHostServer:
         session.map_percent = 0
         session.last_map_info_resend = 0.0
         visible_host_name = self._visible_host_name_for(session)
-        visible_host_id = self._player_id_for_slot(self._visible_host_slot_for(session))
+        visible_host_slot = self._visible_host_slot_for(session)
+        visible_host_id = self._player_id_for_slot(visible_host_slot)
         host_storm_id = self._host_player_id_for(session)
         visible_stat_string = make_stat_string(visible_host_name, self.room_name)
         command2_packet_count, gamedata_unknown, game_uptime_seconds = self._gamedata_fields_for(session)
@@ -882,23 +1211,37 @@ class StarCraftHostServer:
             ),
         )
 
-        player_record_id = WIRE_HOST_ID
-        player_record = player_record_payload(player_record_id, visible_host_name, is_host=True)
-        wire = r.send(
-            CLS_CONTROL,
-            command=CMD_PLAYER,
-            payload=player_record,
-            player_id=host_storm_id,
-        )
-        self._log_join_packet(
+        self._send_wire_host_record(
             session,
-            "PLAYER",
-            wire,
-            detail=(
-                f"record_player_id={player_record_id} visible_host_id={visible_host_id} "
-                f"record_name={visible_host_name!r} is_host=1"
-            ),
+            visible_host_name=visible_host_name,
+            visible_host_id=visible_host_id,
+            command2_packet_count=command2_packet_count,
         )
+
+        visible_session = self._session_for_slot(visible_host_slot)
+        if visible_session is not None and visible_session is not session:
+            peer_command2 = self._peer_record_command2_for(session, visible_session)
+            record_address = self._send_player_record(
+                session,
+                visible_session,
+                is_host=False,
+                command2_packet_count=peer_command2,
+            )
+            LOG.info(
+                "join handshake PLAYER uses real visible player target_player=%s target_name=%r "
+                "record_player_id=%s record_name=%r visible_host_id=%s visible_slot=%s "
+                "record_addr=%s real_addr=%s:%s command2_packet_count=%s",
+                session.player_id,
+                session.name,
+                visible_session.player_id,
+                visible_session.name,
+                visible_host_id,
+                visible_host_slot,
+                f"{record_address[0]}:{record_address[1]}" if record_address is not None else "-",
+                visible_session.address[0],
+                visible_session.address[1],
+                peer_command2,
+            )
 
         statscode = struct.pack("<I", 0)
         wire = r.send(CLS_CONTROL, command=CMD_STATSCODE, payload=statscode, player_id=host_storm_id)
@@ -908,8 +1251,7 @@ class StarCraftHostServer:
         wire = r.send(CLS_CONTROL, command=CMD_GAMETYPE, payload=gametype, player_id=host_storm_id)
         self._log_join_packet(session, "GAMETYPE", wire, detail=f"game_type_payload_len={len(gametype)}")
 
-        for _ in range(JOIN_BOOTSTRAP_SYNC_NOP_COUNT):
-            self._send_sync_nop(session, player_id=host_storm_id)
+        self._send_join_bootstrap_sync_nops(session, player_id=host_storm_id)
 
         wire = r.send(CLS_CONTROL, command=CMD_PING, player_id=host_storm_id)
         try:
@@ -966,9 +1308,10 @@ class StarCraftHostServer:
             detail or "-",
         )
 
-    def _send_sync_packet_now(
+    def _send_sync_packet_to_session_at_seq(
         self,
         session: PlayerSession,
+        seq_send: int,
         *,
         payload: bytes,
         player_id: int = WIRE_HOST_ID,
@@ -976,37 +1319,75 @@ class StarCraftHostServer:
         now: float | None = None,
     ) -> int:
         now = time.monotonic() if now is None else now
-        sent_seq = session.reliable.next_send.get(CLS_SYNC, 0)
-        session.reliable.send(CLS_SYNC, payload=payload, player_id=player_id)
+        sent_seq = seq_send & 0xFFFF
+        session.reliable.send_at_seq(CLS_SYNC, sent_seq, payload=payload, player_id=player_id)
         session.last_sync_packet_sent = now
         if first_scgp(payload) != SCGP_NOP:
             LOG.debug(
-                "sent sync tick business packet player=%s name=%r seq=%s source=%s detail=%s",
+                "sent room sync business packet player=%s name=%r seq=%s room_next=%s source=%s detail=%s",
                 session.player_id,
                 session.name,
                 sent_seq,
+                self.room_sync_next_send,
                 source,
                 _scgp_payload_detail(payload),
             )
         return sent_seq
 
-    def _send_sync_nop(
+    def _send_join_bootstrap_sync_nops(
         self,
         session: PlayerSession,
         *,
         player_id: int = WIRE_HOST_ID,
-        throttle_interval: float = 0.0,
-        now: float | None = None,
-    ) -> int | None:
-        now = time.monotonic() if now is None else now
-        if throttle_interval > 0 and now - session.last_sync_packet_sent < throttle_interval:
-            return None
-        return self._send_sync_packet_now(
-            session,
-            payload=nop_payload(),
-            player_id=player_id,
-            source="NOP",
-            now=now,
+    ) -> None:
+        now = time.monotonic()
+        has_existing_player = any(other is not session and other.joined for other in self.sessions.values())
+        if has_existing_player:
+            start_seq = (self.room_sync_next_send - JOIN_BOOTSTRAP_SYNC_NOP_COUNT) & 0xFFFF
+            sent: list[int] = []
+            for index in range(JOIN_BOOTSTRAP_SYNC_NOP_COUNT):
+                seq = (start_seq + index) & 0xFFFF
+                sent.append(
+                    self._send_sync_packet_to_session_at_seq(
+                        session,
+                        seq,
+                        payload=nop_payload(),
+                        player_id=player_id,
+                        source="join bootstrap backfill NOP",
+                        now=now,
+                    )
+                )
+            session.reliable.next_send[CLS_SYNC] = self.room_sync_next_send
+            LOG.debug(
+                "sent join bootstrap backfill sync nops player=%s name=%r seqs=%s room_next=%s",
+                session.player_id,
+                session.name,
+                ",".join(str(seq) for seq in sent),
+                self.room_sync_next_send,
+            )
+            return
+
+        sent = []
+        for _index in range(JOIN_BOOTSTRAP_SYNC_NOP_COUNT):
+            seq = self.room_sync_next_send
+            sent.append(
+                self._send_sync_packet_to_session_at_seq(
+                    session,
+                    seq,
+                    payload=nop_payload(),
+                    player_id=player_id,
+                    source="join bootstrap NOP",
+                    now=now,
+                )
+            )
+            self.room_sync_next_send = (seq + 1) & 0xFFFF
+        self.room_last_sync_tick_sent = now
+        LOG.debug(
+            "sent initial join bootstrap sync nops player=%s name=%r seqs=%s room_next=%s",
+            session.player_id,
+            session.name,
+            ",".join(str(seq) for seq in sent),
+            self.room_sync_next_send,
         )
 
     def _queue_sync_packet(
@@ -1027,6 +1408,75 @@ class StarCraftHostServer:
             _scgp_payload_detail(payload),
         )
 
+    def _send_due_room_sync_tick(
+        self,
+        *,
+        sessions: Sequence[PlayerSession] | None = None,
+        fallback_player_id: int = WIRE_HOST_ID,
+        throttle_interval: float = LOBBY_SYNC_NOP_INTERVAL,
+        now: float | None = None,
+    ) -> dict[Address, tuple[int, str]] | None:
+        now = time.monotonic() if now is None else now
+        if throttle_interval > 0 and now - self.room_last_sync_tick_sent < throttle_interval:
+            return None
+        targets = list(sessions) if sessions is not None else [
+            session for session in self.sessions.values() if session.joined
+        ]
+        targets = [session for session in targets if session.joined]
+        if not targets:
+            return {}
+
+        seq = self.room_sync_next_send
+        sent: dict[Address, tuple[int, str]] = {}
+        for session in targets:
+            if session.pending_sync_packets:
+                payload, player_id, source = session.pending_sync_packets.popleft()
+            else:
+                payload, player_id, source = nop_payload(), fallback_player_id, "NOP"
+            sent_seq = self._send_sync_packet_to_session_at_seq(
+                session,
+                seq,
+                payload=payload,
+                player_id=player_id,
+                source=source,
+                now=now,
+            )
+            sent[session.address] = (sent_seq, source)
+        self.room_sync_next_send = (seq + 1) & 0xFFFF
+        self.room_last_sync_tick_sent = now
+        return sent
+
+    def _send_room_sync_payload(
+        self,
+        payload: bytes,
+        *,
+        source: str,
+        sessions: Sequence[PlayerSession] | None = None,
+        player_id: int = WIRE_HOST_ID,
+        now: float | None = None,
+    ) -> dict[Address, int]:
+        now = time.monotonic() if now is None else now
+        targets = list(sessions) if sessions is not None else [
+            session for session in self.sessions.values() if session.joined
+        ]
+        targets = [session for session in targets if session.joined]
+        if not targets:
+            return {}
+        seq = self.room_sync_next_send
+        sent: dict[Address, int] = {}
+        for session in targets:
+            sent[session.address] = self._send_sync_packet_to_session_at_seq(
+                session,
+                seq,
+                payload=payload,
+                player_id=player_id,
+                source=source,
+                now=now,
+            )
+        self.room_sync_next_send = (seq + 1) & 0xFFFF
+        self.room_last_sync_tick_sent = now
+        return sent
+
     def _send_due_sync_tick(
         self,
         session: PlayerSession,
@@ -1035,27 +1485,14 @@ class StarCraftHostServer:
         throttle_interval: float = LOBBY_SYNC_NOP_INTERVAL,
         now: float | None = None,
     ) -> tuple[int, str] | None:
-        now = time.monotonic() if now is None else now
-        if throttle_interval > 0 and now - session.last_sync_packet_sent < throttle_interval:
-            return None
-        if session.pending_sync_packets:
-            payload, player_id, source = session.pending_sync_packets.popleft()
-            sent_seq = self._send_sync_packet_now(
-                session,
-                payload=payload,
-                player_id=player_id,
-                source=source,
-                now=now,
-            )
-            return sent_seq, source
-        sent_seq = self._send_sync_packet_now(
-            session,
-            payload=nop_payload(),
-            player_id=fallback_player_id,
-            source="NOP",
+        sent = self._send_due_room_sync_tick(
+            fallback_player_id=fallback_player_id,
+            throttle_interval=throttle_interval,
             now=now,
         )
-        return sent_seq, "NOP"
+        if sent is None:
+            return None
+        return sent.get(session.address)
 
     def _note_join_ping_ack(self, session: PlayerSession, packet: StormPacket, *, source: str) -> None:
         if session.lobby_snapshot_sent:
@@ -1138,6 +1575,83 @@ class StarCraftHostServer:
         session.reliable.send(CLS_ASYNC, payload=bytes([SCGP_UNKNOWNREQUEST]), player_id=host_player_id)
         LOG.info("sent initial ROOMDATA/UNKNOWNREQUEST prompt to player=%s name=%r", session.player_id, session.name)
 
+    def _send_wire_host_record(
+        self,
+        session: PlayerSession,
+        *,
+        visible_host_name: str,
+        visible_host_id: int,
+        command2_packet_count: int,
+    ) -> None:
+        player_record = player_record_payload(
+            WIRE_HOST_ID,
+            visible_host_name,
+            is_host=True,
+            command2_packet_count=command2_packet_count,
+        )
+        wire = session.reliable.send(
+            CLS_CONTROL,
+            command=CMD_PLAYER,
+            payload=player_record,
+            player_id=self._host_player_id_for(session),
+        )
+        self._log_join_packet(
+            session,
+            "PLAYER",
+            wire,
+            detail=(
+                f"record_player_id={WIRE_HOST_ID} visible_host_id={visible_host_id} "
+                f"record_name={visible_host_name!r} is_host=1 source=wire_host "
+                f"command2_packet_count={command2_packet_count}"
+            ),
+        )
+
+    def _send_player_record(
+        self,
+        target_session: PlayerSession,
+        subject_session: PlayerSession,
+        *,
+        is_host: bool = False,
+        command2_packet_count: int | None = None,
+    ) -> Address | None:
+        record_address = None if is_host else self._relay_address_for(target_session, subject_session)
+        if command2_packet_count is None:
+            command2_packet_count = self._peer_record_command2_for(target_session, subject_session)
+        payload = player_record_payload(
+            subject_session.player_id,
+            subject_session.name,
+            is_host=is_host,
+            address=record_address,
+            command2_packet_count=command2_packet_count,
+        )
+        wire = target_session.reliable.send(
+            CLS_CONTROL,
+            command=CMD_PLAYER,
+            payload=payload,
+            player_id=self._host_player_id_for(target_session),
+        )
+        LOG.info(
+            "sent PLAYER record to player=%s name=%r for subject_player=%s subject_name=%r "
+            "is_host=%s record_addr=%s real_addr=%s:%s command2_packet_count=%s wire_len=%s",
+            target_session.player_id,
+            target_session.name,
+            subject_session.player_id,
+            subject_session.name,
+            int(is_host),
+            f"{record_address[0]}:{record_address[1]}" if record_address is not None else "0.0.0.0:0",
+            subject_session.address[0],
+            subject_session.address[1],
+            command2_packet_count,
+            len(wire),
+        )
+        return record_address
+
+    def _announce_player_record_to_existing(self, joining_session: PlayerSession) -> None:
+        for session in self.sessions.values():
+            if session is joining_session or not session.joined or not session.lobby_ready:
+                continue
+            self._send_player_record(session, joining_session, is_host=False)
+
     def _broadcast_player_join(self, joined_session: PlayerSession) -> None:
         for session in self.sessions.values():
             if not session.joined:
@@ -1148,10 +1662,20 @@ class StarCraftHostServer:
                 player_id=self._host_player_id_for(session),
             )
 
-    def _broadcast_slot_state(self) -> None:
+    def _broadcast_slot_state(
+        self,
+        *,
+        source: str = "broadcast",
+        include_map_percent: bool = True,
+        except_session: PlayerSession | None = None,
+        ready_only: bool = False,
+    ) -> None:
         for session in self.sessions.values():
-            if session.joined:
-                self._send_slot_state(session, source="broadcast")
+            if session is except_session or not session.joined:
+                continue
+            if ready_only and not session.lobby_ready:
+                continue
+            self._send_slot_state(session, source=source, include_map_percent=include_map_percent)
 
     def _send_slot_state(
         self,
@@ -1295,6 +1819,12 @@ class StarCraftHostServer:
             None,
         )
 
+    def _session_for_player_id(self, player_id: int) -> PlayerSession | None:
+        return next(
+            (session for session in self.sessions.values() if session.joined and session.player_id == player_id),
+            None,
+        )
+
     def _game_joined_session_for_slot(self, slot_index: int) -> PlayerSession | None:
         return next(
             (
@@ -1365,15 +1895,15 @@ class StarCraftHostServer:
             self._auto_start_task = None
             self._maybe_schedule_auto_start()
             return
-        for session in self.sessions.values():
-            if session.joined:
-                LOG.info("STARTGAME to player=%s sync_seq=%s", session.player_id, session.reliable.next_send.get(CLS_SYNC))
-                self._send_sync_packet_now(
-                    session,
-                    payload=startgame_payload(),
-                    player_id=self._host_player_id_for(session),
-                    source="STARTGAME",
-                )
+        joined = [session for session in self.sessions.values() if session.joined]
+        startgame_sent = self._send_room_sync_payload(
+            startgame_payload(),
+            source="STARTGAME",
+            sessions=joined,
+            player_id=WIRE_HOST_ID,
+        )
+        for session in joined:
+            LOG.info("STARTGAME to player=%s sync_seq=%s", session.player_id, startgame_sent.get(session.address))
         self._start_nop_task = asyncio.create_task(self._start_transition_nop_loop())
         try:
             await asyncio.sleep(self.seed_delay)
@@ -1388,17 +1918,18 @@ class StarCraftHostServer:
             self._start_nop_task.cancel()
             self._start_nop_task = None
         seed = seed_payload()
-        for session in self.sessions.values():
+        joined = [session for session in self.sessions.values() if session.joined]
+        seed_sent = self._send_room_sync_payload(
+            seed,
+            source="SEED",
+            sessions=joined,
+            player_id=WIRE_HOST_ID,
+        )
+        for session in joined:
             if session.joined:
                 host_player_id = self._host_player_id_for(session)
-                self._send_sync_packet_now(
-                    session,
-                    payload=seed,
-                    player_id=host_player_id,
-                    source="SEED",
-                )
                 session.reliable.send(CLS_ASYNC, payload=map_complete_payload(), player_id=host_player_id)
-                LOG.info("MAP complete to player=%s after SEED", session.player_id)
+                LOG.info("MAP complete to player=%s after SEED sync_seq=%s", session.player_id, seed_sent.get(session.address))
         self.starting = False
         self.started = True
         self._auto_start_task = None
@@ -1408,13 +1939,10 @@ class StarCraftHostServer:
         try:
             while self.starting and not self.closed:
                 await asyncio.sleep(START_TRANSITION_SYNC_INTERVAL)
-                for session in list(self.sessions.values()):
-                    if session.joined:
-                        self._send_due_sync_tick(
-                            session,
-                            fallback_player_id=self._host_player_id_for(session),
-                            throttle_interval=START_TRANSITION_SYNC_INTERVAL,
-                        )
+                self._send_due_room_sync_tick(
+                    fallback_player_id=WIRE_HOST_ID,
+                    throttle_interval=START_TRANSITION_SYNC_INTERVAL,
+                )
         except asyncio.CancelledError:
             return
 
@@ -1423,14 +1951,10 @@ class StarCraftHostServer:
             await asyncio.sleep(LOBBY_SYNC_NOP_INTERVAL)
             if self.starting or self.started:
                 continue
-            for session in list(self.sessions.values()):
-                if not session.joined:
-                    continue
-                self._send_due_sync_tick(
-                    session,
-                    fallback_player_id=self._host_player_id_for(session),
-                    throttle_interval=LOBBY_SYNC_NOP_INTERVAL,
-                )
+            self._send_due_room_sync_tick(
+                fallback_player_id=WIRE_HOST_ID,
+                throttle_interval=LOBBY_SYNC_NOP_INTERVAL,
+            )
 
     async def _advertise_loop(self) -> None:
         while not self.closed:
@@ -1450,12 +1974,19 @@ class StarCraftHostServer:
             self.discovery_transport.sendto(packet, addr)
             _log_protocol_lan("tx", packet, addr, event="room_advertisement_broadcast")
 
-    def _disconnect(self, session: PlayerSession, reason: str) -> None:
+    def _disconnect(self, session: PlayerSession, reason: str, *, payload: bytes | None = None) -> None:
         LOG.info("disconnect player=%s reason=%s", session.player_id, reason)
-        for other in self.sessions.values():
+        quit_data = payload if payload is not None else quit_payload()
+        for other in list(self.sessions.values()):
             if other is not session and other.joined:
-                other.reliable.send(CLS_CONTROL, command=CMD_QUIT, payload=quit_payload())
+                other.reliable.send(CLS_CONTROL, command=CMD_QUIT, payload=quit_data, player_id=session.player_id)
         self.sessions.pop(session.address, None)
+        self._close_peer_relays_for(session)
+        self._broadcast_slot_state(
+            source=f"player {session.player_id} quit",
+            include_map_percent=True,
+            ready_only=True,
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

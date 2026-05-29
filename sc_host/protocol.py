@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import socket
 import struct
 import time
 
@@ -205,12 +206,37 @@ def gamedata_payload(
     )
 
 
-def player_record_payload(player_id: int, name: str, *, is_host: bool = True) -> bytes:
+def player_record_payload(
+    player_id: int,
+    name: str,
+    *,
+    is_host: bool = True,
+    address: tuple[str, int] | None = None,
+    command2_packet_count: int = 0x66,
+) -> bytes:
     encoded_name = name.encode("latin1", "replace")
     size = 36 + len(encoded_name) + 2
     # The first dword is the total PLAYER payload size. Captures show 0x29 for
     # "Sun" and 0x2a for "SunX", so it must track the encoded name length.
-    fixed = struct.pack("<IIIIIIIII", size, player_id, 1 if is_host else 0, 0, 0x66, 0, 0, 0, 0)
+    if address is None:
+        peer_flag = 0
+        sockaddr = b"\0" * 16
+    else:
+        peer_flag = 4
+        sockaddr = (
+            struct.pack("<H", socket.AF_INET)
+            + struct.pack("!H", address[1])
+            + socket.inet_aton(address[0])
+            + b"\0" * 8
+        )
+    fixed = struct.pack(
+        "<IIIII",
+        size,
+        player_id,
+        1 if is_host else 0,
+        peer_flag,
+        command2_packet_count,
+    ) + sockaddr
     return fixed + encoded_name + b"\0\0"
 
 
