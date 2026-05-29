@@ -179,9 +179,25 @@ def gametype_payload() -> bytes:
     )
 
 
-def gamedata_payload(player_id: int, host_name: str, stat_string: str, max_players: int = 2) -> bytes:
+def gamedata_payload(
+    player_id: int,
+    host_name: str,
+    stat_string: str,
+    max_players: int = 2,
+    *,
+    command2_packet_count: int = 0x66,
+    unknown: int = 0x06,
+    game_uptime_seconds: int = 0,
+) -> bytes:
     return (
-        struct.pack("<IIIII", player_id, max_players, 0x66, 0x06, 0x19)
+        struct.pack(
+            "<IIIII",
+            player_id,
+            max_players,
+            command2_packet_count,
+            unknown,
+            game_uptime_seconds,
+        )
         + host_name.encode("latin1", "replace")
         + b"\0"
         + stat_string.encode("latin1", "replace")
@@ -189,12 +205,12 @@ def gamedata_payload(player_id: int, host_name: str, stat_string: str, max_playe
     )
 
 
-def player_record_payload(player_id: int, name: str) -> bytes:
+def player_record_payload(player_id: int, name: str, *, is_host: bool = True) -> bytes:
     encoded_name = name.encode("latin1", "replace")
     size = 36 + len(encoded_name) + 2
     # The first dword is the total PLAYER payload size. Captures show 0x29 for
     # "Sun" and 0x2a for "SunX", so it must track the encoded name length.
-    fixed = struct.pack("<IIIIIIIII", size, player_id, 1, 0, 0x66, 0, 0, 0, 0)
+    fixed = struct.pack("<IIIIIIIII", size, player_id, 1 if is_host else 0, 0, 0x66, 0, 0, 0, 0)
     return fixed + encoded_name + b"\0\0"
 
 
@@ -232,8 +248,8 @@ def slot_sync_payload(
     player0_race: int = 6,
     player1_race: int = 6,
     *,
-    player0_id: int = 0,
-    player1_id: int = 1,
+    player0_id: int = 1,
+    player1_id: int = 2,
     player0_active: bool = True,
     player1_active: bool = True,
     player0_team: int = 1,
@@ -243,8 +259,8 @@ def slot_sync_payload(
 ) -> bytes:
     slot0_player = player0_id if player0_active else 0xFF
     slot1_player = player1_id if player1_active else 0xFF
-    slot0_state = 2 if player0_active else 0
-    slot1_state = 2 if player1_active else 0
+    slot0_state = 2 if player0_active else 6
+    slot1_state = 2 if player1_active else 6
     net_players = []
     if player1_active:
         net_players.append(new_net_player(player1_id))

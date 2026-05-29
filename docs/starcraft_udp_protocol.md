@@ -12,6 +12,7 @@
 - [Valhalla Legends: StarCraft UDP / SCGP specification](https://vl.bnetdocs.org/index.php?topic=17702.0)
 - [BNETDocs: Game Statstrings](https://bnetdocs.org/document/13/game-statstrings)
 - [BNETDocs Redux: SCGP_SEED](https://redux.bnetdocs.org/?op=packet&pid=502)
+- 本地目标版本二进制静态观察：`E:\Game\starcraftV1.08\starcraft.exe`、`storm.dll`、`standard.snp`
 
 可信度标记：
 
@@ -20,6 +21,17 @@
 - **抓包/实现待验证**：来自抓包常量、现有实现或经验推测，需要继续用抓包验证。
 
 公开资料本身是第三方逆向结果，并非 Blizzard 官方协议文档。存在字段命名不一致、长度含糊、不同 StarCraft/Brood War 版本行为不同的风险。
+
+### 本地二进制观察
+
+抓包可以确认 wire 顺序；`starcraft.exe` 静态观察主要用于确认职责边界，而不是单独证明每个字段含义。
+
+- `starcraft.exe` 不直接导入 `WSOCK32.dll` / `WS2_32.dll`，网络发送不是由 EXE 直接调用 socket 完成。
+- `starcraft.exe` 导入大量 `Storm.dll` ordinal-only 函数；LAN UDP provider 相关字符串和 Winsock 依赖出现在 `standard.snp` 中。
+- `standard.snp` 包含 `Local Area Network (UDP/IP)`、`SnpQuery`、`SnpBind`、`SYS_QUERYGAME`、`SYS_GAMEINFO` 等字符串，说明 LAN discovery/provider 层在 SNP 中。
+- `starcraft.exe` 包含 `CreateGame_MultiPlayer()`、`net_mgr.cpp`、`net_misc.cpp`、`net_player.cpp`、`gamedata.cpp`、`gamemap.cpp`、`gametype.cpp`、`gluBNCreate.cpp`、`gluJoin.cpp` 等源码路径字符串，说明房间、玩家、地图、game type 等语义结构由 EXE 侧组织，再交给 Storm/SNP 发送。
+- `CreateGame_MultiPlayer()` 字符串引用位于 `RVA 0x78965`，所在函数约为 `RVA 0x78910..0x78AC5`。该函数调用 game type、net manager 和 Storm ordinal，符合“建主初始化游戏语义状态，然后交给 Storm 网络层”的模型。
+- 因此，本文的“主动/响应”分类以公开资料和本地抓包顺序为主，`starcraft.exe` 静态观察作为结构性佐证：EXE 负责决定何时构造 lobby/game 语义包，SNP/Storm 负责 UDP/provider/reliable 传输。
 
 ## 基础约定
 
@@ -223,33 +235,90 @@ Valhalla SCGP spec 将以下 command 描述为 control/internal packets。字段
 
 - 常见为空 payload。
 - 主要用于保持连接、确认对端存在和更新延迟。
+- `PING` 可由任一端主动发起，用作探测或节奏推进；`PONG` 应视为对收到的 `PING` 的被动回应。
+
+## 发送时机模型
+
+`starcraft.exe` 的静态结构显示，房间、地图、玩家和 game type 语义由 EXE 侧组织，UDP/provider 由 Storm/SNP 侧承担。因此，协议实现不应把大厅包当作一组固定脚本一次性全发，而应按 join/lobby 状态机响应客户端事件。下面的分类结合公开资料、本地抓包和 `starcraft.exe` 职责边界整理。
+
+术语：
+
+- **主动发送**：由本端状态、用户操作、计时器或建主流程主动产生，不直接依赖刚收到的某个语义包。
+- **被动响应**：收到特定包后推进下一步；如果没有该输入，不应提前发送。
+- **状态推进**：不是单包一问一答，但需要等待可靠层、PING/PONG 或 lobby state 到达某个门槛后发送。
+- **转发/广播**：收到某玩家事件后，host/relay 转发给其他玩家或广播房间状态。
+
+### Control 包发送时机
+
+| Packet | Direction | Timing | Trigger / condition |
+| --- | --- | --- | --- |
+| `REQUESTJOIN` | client -> host | 主动发送 | 客户端从 LAN 列表选择房间后发起加入 |
+| `REQUESTJOINOK` | host -> client | 被动响应 | host 接受 `REQUESTJOIN` |
+| `JOINFAIL` | host -> client | 被动响应 | host 拒绝 `REQUESTJOIN`，例如满员、版本/状态不匹配 |
+| `REQUESTJOIN2` | client -> host | 被动响应/流程继续 | 客户端收到 `REQUESTJOINOK` 后继续 join handshake |
+| `ENTER(name)` | client -> host | 被动响应/流程继续 | 客户端进入 join handshake 后提交玩家名 |
+| `GAMEDATA` | host -> client | 被动响应 | host 接受 `ENTER` 后发送分配的 player id、game name、statstring 等 |
+| `PLAYER` | host -> client | 被动响应 | 通常紧跟 `GAMEDATA`，给 joining client 提供已有 player/host record |
+| `STATSCODE` | host -> client | 被动响应 | 通常紧跟 `PLAYER`，提供 game stat code |
+| `GAMETYPE` | host -> client | 被动响应 | 通常紧跟 `STATSCODE`，提供 game type/template/lobby option 信息 |
+| `PING` | both | 主动发送/状态推进 | 任一端用于探测、延迟更新或推进 join/lobby 节奏 |
+| `PONG` | both | 被动响应 | 对收到的 `PING` 回应 |
+| `GAMESTATE` | host -> client | 状态推进 | 开局前后由 host 推进游戏状态；具体触发仍需更多抓包 |
+| `QUIT` | both | 主动发送/转发 | 玩家离开、断开或 host 关闭房间 |
+
+### SCGP 包发送时机
+
+| Packet | Direction | Timing | Trigger / condition |
+| --- | --- | --- | --- |
+| `NOP` | both | 主动发送/周期 | `CLS=2` 同步 keepalive；大厅和游戏阶段都可能穿插出现 |
+| `ROOMDATA` | host -> client | 状态推进 | join control 包和必要 PING/PONG 后，host 向 joining client 推送 room slot/force 数据；抓包中位于 `JOINEDGAME` 之前 |
+| `UNKNOWNREQUEST(0x50)` | host -> client | 状态推进 | 抓包中常与 `ROOMDATA` 同阶段发送，位于 `JOINEDGAME` 之前；语义未完全确认 |
+| `JOINEDGAME` | client -> host | 被动响应 | 客户端收到足够 lobby bootstrap 数据后，报告已进入 game/lobby |
+| `PLAYERJOIN` | host -> client(s) | 被动响应/广播 | host 收到 `JOINEDGAME` 后通知玩家加入；抓包确认至少会发给 joining client 本人 |
+| `MAP(kind=0x0001)` | host -> client | 被动响应 | host 收到 `JOINEDGAME` 后询问/发送地图信息，通常跟在 `PLAYERJOIN` 后 |
+| `MAP(kind=0x0000)` | client -> host | 被动响应 | 客户端收到 `MAP(kind=0x0001)` 后回报本地地图 file position/状态 |
+| `MAPPERCENT(100)` | host -> client | 被动响应 | 客户端 `MAP(kind=0x0000)` 表示已有完整地图后，host 推进 map/lobby 完成状态 |
+| `SLOTUPDATE` | host -> client(s) | 被动响应/广播 | 加入、地图状态、换种族、slot 变化等事件后发送 slot 快照或增量 |
+| `NEWNETPLAYER` | host -> client(s) | 被动响应/广播 | 新玩家进入 lobby/map ready 后宣布网络玩家记录，抓包中常与 `MAPPERCENT`、`SLOTUPDATE` 合包 |
+| `MAPPERCENT(100)` | client -> host | 被动响应/状态更新 | 客户端收到 host 的 map/lobby 完成推进后，回报自己的加载百分比 |
+| `CHANGERACE` | client -> host -> peers | 主动发送/转发 | 玩家在大厅改 race；host/relay 转发并可能伴随 `SLOTUPDATE` |
+| `LOBBYCHAT` | client -> host -> peers | 主动发送/转发 | 玩家发送大厅聊天；host/relay 转发 |
+| `STARTGAME` | host -> client(s) | 主动发送 | host/creator 点击开始且房间条件满足 |
+| `SEED` | host -> client(s) | 状态推进 | `STARTGAME` 后进入开局同步，host 发送随机种子 |
+| `MAP(kind=0x0003)` | host -> client(s) / unclear | 状态推进 | 本地抓包中出现在 `STARTGAME`/`SEED` 之后的开局转换阶段；不应作为 `MAP(kind=0x0000)` 的直接大厅响应 |
+| `SYNC` / game commands | players -> host/peers | 主动发送/转发 | 游戏 turn 内玩家操作或同步事件；relay/host 应按目标拓扑转发 |
 
 ## 加入房间流程
 
-典型 LAN 加入流程：
+典型 LAN 加入流程应按事件响应推进：
 
 ```text
-client -> host: REQUESTJOIN
-host   -> client: REQUESTJOINOK
-client -> host: REQUESTJOIN2
-client -> host: ENTER(name)
-host   -> client: GAMEDATA
-host   -> client: PLAYER
-host   -> client: STATSCODE
-host   -> client: GAMETYPE
-host   -> client: PING
-host   -> client: CLS_SYNC NOP
-host   -> client: ROOMDATA / UNKNOWNREQUEST
-client -> host: JOINEDGAME
-host   -> client: PLAYERJOIN / MAP(kind=0x0001)
-client -> host: MAP(kind=0x0000)
+client -> host: REQUESTJOIN                 # client 主动选择房间
+host   -> client: REQUESTJOINOK             # response to REQUESTJOIN
+client -> host: REQUESTJOIN2                # response/continuation
+client -> host: ENTER(name)                 # response/continuation, 提交玩家名
+host   -> client: GAMEDATA                  # response to ENTER
+host   -> client: PLAYER                    # ENTER 后的 bootstrap record
+host   -> client: STATSCODE                 # ENTER 后的 bootstrap metadata
+host   -> client: GAMETYPE                  # ENTER 后的 bootstrap metadata
+host   -> client: PING                      # host 探测/推进 join 节奏
+client -> host: PONG                        # response to host PING
+client -> host: PING                        # 抓包中常见的 client 侧探测/确认
+host   -> client: PONG                      # response to client PING
+host   -> client: ROOMDATA / UNKNOWNREQUEST # join bootstrap 状态推进，位于 JOINEDGAME 前
+client -> host: JOINEDGAME                  # client 已接受 room/lobby 数据
+host   -> client: PLAYERJOIN                # response to JOINEDGAME
+host   -> client: MAP(kind=0x0001)          # response to JOINEDGAME, 发送/询问地图信息
+client -> host: MAP(kind=0x0000)            # response to MAP(kind=0x0001), 回报地图状态
 host   -> client: MAPPERCENT(100) + SLOTUPDATE + NEWNETPLAYER
-client -> host: MAPPERCENT(100)
+                                             # response to MAP(kind=0x0000), 推进 lobby 快照
+client -> host: MAPPERCENT(100)             # client 回报加载/地图状态
 ```
 
 抓包确认：
 
 - `D:\tmp\sc\host2.pcapng`、`client.pcapng`、`client_multi.pcapng` 中，`ROOMDATA` 和 `UNKNOWNREQUEST(0x50)` 出现在 `JOINEDGAME(0x40)` 之前。
+- `ROOMDATA`/`UNKNOWNREQUEST` 不是 `JOINEDGAME` 的响应；它们更像是 control join 和 PING/PONG 完成后的 host-side lobby bootstrap 推送。若客户端尚未完成前面的确认，过早发送可能被忽略或导致状态不同步。
 - `JOINEDGAME` 是 client -> host 的 `CLS=2` normal 包，不是 `CLS=1`；payload 不只有 `0x40` 一个字节，常见抓包为 `40 00 00 00 00 00 00 00 00 01 00 05 00 00 2f 84 6c d3`，后续字段仍待解释。
 - host 在收到 `JOINEDGAME` 后，会向该 joining client 发送 `PLAYERJOIN(player_id)`，然后发送 `MAP(kind=0x0001)`。
 - client 对 `MAP(kind=0x0001)` 回 `MAP(kind=0x0000)`；若客户端已有完整地图，payload 中的 file position 等于 map size。
@@ -260,6 +329,7 @@ client -> host: MAPPERCENT(100)
 
 - `ENTER` 之后，host 需要向客户端提供足够的 lobby bootstrap 信息，否则客户端可能停在等待大厅状态。
 - `ROOMDATA`、`MAP`、slot state 和 `PLAYERJOIN` 的相对顺序可能影响客户端进入大厅。
+- `PLAYERJOIN`、`MAP(kind=0x0001)`、`MAPPERCENT/SLOTUPDATE/NEWNETPLAYER` 不应在 `ENTER` 后一次性提前全发；抓包显示它们分别受 `JOINEDGAME` 和 `MAP(kind=0x0000)` 驱动。
 - `CLS_SYNC` 即使在大厅阶段也可能需要持续 NOP/slot sync 以维护 turn/reliable 状态。
 
 ## SCGP common packets

@@ -21,7 +21,8 @@ The first version is intentionally narrow:
 - `SEXP / 0xC3`
 - UDP `6111` room discovery and UDP `6112` Storm traffic
 - fixed 1v1 room
-- MainHost/SubHost view: `Sun` is MainHost, and `SunX` is the host visible to MainHost
+- stable player ids: `Sun` is player `1`, `SunX` is player `2`; Storm host/control sender id stays `0`
+- MainHost/SubHost view: host identity is expressed with the `PLAYER` host flag and creator metadata
 - fixed Challenger room/map metadata
 - central relay: real clients talk to Python, not to each other
 - periodic LAN room advertisements, plus replies to client search broadcasts
